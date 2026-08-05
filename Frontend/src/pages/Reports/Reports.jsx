@@ -23,6 +23,7 @@ import {
   exportProgressUrl,
   prepareExcelStreamJob,
   exportStreamUrl,
+  startExcelToDownloads,
 } from '../../services/api'
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
@@ -60,10 +61,50 @@ function toISO(dtLocal) {
 const V_ROW_H      = 30    // px — fixed row height (kept exact so the math is stable)
 const V_VIEWPORT_H = 460   // px — scroll viewport height
 const V_OVERSCAN   = 10    // extra rows rendered above/below the viewport
+// Column virtualization only engages for genuinely WIDE tables (e.g. 700+ tags);
+// narrow/normal reports render every column exactly as before (zero behaviour change).
+const V_COL_MIN    = 60    // engage column virtualization only when cols exceed this
+const V_COL_OVERSCAN = 3   // extra columns rendered left/right of the viewport
+const V_DEFAULT_VIEW_W = 1200  // fallback viewport width before the container is measured
+
+// T1/T2 Isolation column order — MUST match the Excel export exactly
+// (backend `_order_isolation_columns`): group every field of the same numeric ID
+// together, IDs ascending, fields alphabetical within an ID
+// (ALARM, BATTERY_LEVEL, ELEVATION_POSITION, ELEVATION_SETPOINT, MAX_MOTOR_CURRENT,
+// OPERATION_MODE, …). Grouping is derived dynamically from the {FIELD}_ID{n} column
+// names — no hardcoded field list or ID count. A field missing for an ID is simply
+// absent (its column isn't in the list), so it is skipped and the ID's remaining
+// fields still follow in order. Columns that don't match keep their order and go
+// last. V8's sort is stable (ES2019), so equal-key columns retain their input order.
+const ISO_ID_COL_RE = /^(.*)_ID(\d+)$/i
+
+function orderIsolationColumns(cols) {
+  return [...cols].sort((a, b) => {
+    const ma = ISO_ID_COL_RE.exec(a)
+    const mb = ISO_ID_COL_RE.exec(b)
+    if (ma && mb) {
+      const d = Number(ma[2]) - Number(mb[2])          // ID ascending
+      if (d !== 0) return d
+      const fa = ma[1].toUpperCase(), fb = mb[1].toUpperCase()
+      return fa < fb ? -1 : fa > fb ? 1 : 0            // field alphabetical
+    }
+    if (ma) return -1                                  // ID columns before non-ID
+    if (mb) return 1
+    return 0                                           // both non-ID: keep order
+  })
+}
+
+// Presentation-only: map an internal isolation table id (T1_IS3 / T2_IS13) to its
+// Tracker display name (Tracker3 / Tracker13). Pure and id-shaped, so any non-isolation
+// equipment id passes through unchanged. The underlying value/id is never mutated.
+function trackerDisplayName(id) {
+  const m = /^T\d+_IS0*(\d+)$/i.exec(String(id ?? ''))
+  return m ? `Tracker${m[1]}` : id
+}
 
 function renderCell(col, val) {
   if (col.key === '_equipment')
-    return <span className="font-mono text-[11px] text-ge-blue">{val}</span>
+    return <span className="font-mono text-[11px] text-ge-blue">{trackerDisplayName(val)}</span>
   if (col.isTs)
     return <span className="font-mono text-[11px] text-ge-text3">{fmtTimestamp(val)}</span>
   if (val === null || val === undefined)
@@ -77,29 +118,66 @@ function renderCell(col, val) {
 // like "31/12/2024 23:59:59" and "INVERTER1_SMB" are never clipped.
 const colWidth = (c) => (c.isTs ? 190 : c.key === '_equipment' ? 150 : 120)
 
+const _cellStyle = {
+  height: V_ROW_H, paddingTop: 0, paddingBottom: 0, boxSizing: 'border-box',
+  whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
+}
+
+// One data row. Memoized so vertical scrolling only mounts the newly-revealed rows
+// instead of re-rendering every visible row on each frame. `visCols` is a stable
+// slice (see useMemo below), so a row that stays on screen skips re-render entirely.
+const VirtualRow = React.memo(function VirtualRow({ row, visCols, leftPad, rightPad }) {
+  return (
+    <tr style={{ height: V_ROW_H }}>
+      {leftPad > 0 && <td aria-hidden style={{ padding: 0, border: 0, width: leftPad }} />}
+      {visCols.map(col => (
+        <td key={col.key} style={_cellStyle}>{renderCell(col, row[col.key])}</td>
+      ))}
+      {rightPad > 0 && <td aria-hidden style={{ padding: 0, border: 0, width: rightPad }} />}
+    </tr>
+  )
+})
+
 function VirtualDataTable({ cols = [], rows = [] }) {
   const [scrollTop, setScrollTop] = useState(0)
+  const [scrollLeft, setScrollLeft] = useState(0)
+  const [viewW, setViewW] = useState(V_DEFAULT_VIEW_W)
   const rafRef = useRef(0)
   const scrollRef = useRef(null)
 
-  // Reset to the top whenever the page's data changes (new page / new dataset).
+  // Reset to the top-left whenever the page's data changes (new page / new dataset),
+  // and (re)measure the viewport width so column virtualization has the real width.
   useEffect(() => {
-    if (scrollRef.current) scrollRef.current.scrollTop = 0
-    setScrollTop(0)
+    const el = scrollRef.current
+    if (el) { el.scrollTop = 0; el.scrollLeft = 0; setViewW(el.clientWidth || V_DEFAULT_VIEW_W) }
+    setScrollTop(0); setScrollLeft(0)
   }, [rows, cols])
+
+  // Keep the measured width current on container resize; clean up the observer.
+  useEffect(() => {
+    const el = scrollRef.current
+    if (!el || typeof ResizeObserver === 'undefined') return
+    const ro = new ResizeObserver(() => setViewW(el.clientWidth || V_DEFAULT_VIEW_W))
+    ro.observe(el)
+    return () => ro.disconnect()
+  }, [])
 
   // Cancel any pending scroll frame on unmount.
   useEffect(() => () => { if (rafRef.current) cancelAnimationFrame(rafRef.current) }, [])
 
+  // One state update per animation frame for BOTH axes (coalesced) — no layout
+  // thrash while scrolling.
   const onScroll = (e) => {
     const top = e.currentTarget.scrollTop
-    if (rafRef.current) return               // coalesce to one update per frame
+    const left = e.currentTarget.scrollLeft
+    if (rafRef.current) return
     rafRef.current = requestAnimationFrame(() => {
       rafRef.current = 0
-      setScrollTop(top)
+      setScrollTop(top); setScrollLeft(left)
     })
   }
 
+  // ── Row window (vertical virtualization) ─────────────────────────────────
   const total = rows.length
   const start = Math.max(0, Math.floor(scrollTop / V_ROW_H) - V_OVERSCAN)
   const visibleCount = Math.ceil(V_VIEWPORT_H / V_ROW_H) + V_OVERSCAN * 2
@@ -108,11 +186,33 @@ function VirtualDataTable({ cols = [], rows = [] }) {
   const padBottom = Math.max(0, (total - end) * V_ROW_H)
   const visible = rows.slice(start, end)
 
-  const totalW = cols.reduce((w, c) => w + colWidth(c), 0)
-  const cellStyle = {
-    height: V_ROW_H, paddingTop: 0, paddingBottom: 0, boxSizing: 'border-box',
-    whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis',
+  // ── Column window (horizontal virtualization) ────────────────────────────
+  // Prefix-sum of column widths (recomputed only when the column set changes) lets us
+  // map scrollLeft → the exact visible column range, with left/right spacer cells whose
+  // widths equal the skipped columns — so alignment is pixel-exact and column widths,
+  // sticky header, sorting/filtering and data are all unchanged.
+  const { totalW, offsets } = useMemo(() => {
+    const offs = new Array(cols.length + 1); offs[0] = 0
+    for (let i = 0; i < cols.length; i++) offs[i + 1] = offs[i] + colWidth(cols[i])
+    return { totalW: offs[cols.length], offsets: offs }
+  }, [cols])
+
+  const virtualizeCols = cols.length > V_COL_MIN
+  let colStart = 0, colEnd = cols.length, leftPad = 0, rightPad = 0
+  if (virtualizeCols) {
+    // Binary-ish linear scan is fine (cols ≤ ~800); find first/last visible column.
+    while (colStart < cols.length && offsets[colStart + 1] <= scrollLeft) colStart++
+    colStart = Math.max(0, colStart - V_COL_OVERSCAN)
+    const right = scrollLeft + viewW
+    colEnd = colStart
+    while (colEnd < cols.length && offsets[colEnd] < right) colEnd++
+    colEnd = Math.min(cols.length, colEnd + V_COL_OVERSCAN)
+    leftPad = offsets[colStart]
+    rightPad = Math.max(0, totalW - offsets[colEnd])
   }
+  const visCols = useMemo(
+    () => (virtualizeCols ? cols.slice(colStart, colEnd) : cols),
+    [cols, virtualizeCols, colStart, colEnd])
 
   return (
     <div ref={scrollRef} onScroll={onScroll}
@@ -120,36 +220,37 @@ function VirtualDataTable({ cols = [], rows = [] }) {
          style={{ maxHeight: V_VIEWPORT_H }}>
       <table className="data-table" style={{ tableLayout: 'fixed', width: totalW }}>
         <colgroup>
-          {cols.map(c => (
-            <col key={c.key} style={{ width: colWidth(c) }} />
-          ))}
+          {leftPad > 0 && <col style={{ width: leftPad }} />}
+          {visCols.map(c => <col key={c.key} style={{ width: colWidth(c) }} />)}
+          {rightPad > 0 && <col style={{ width: rightPad }} />}
         </colgroup>
         <thead>
           <tr>
-            {cols.map(c => (
+            {leftPad > 0 && <th aria-hidden className="sticky top-0 z-10" style={{ padding: 0, border: 0 }} />}
+            {visCols.map(c => (
               <th key={c.key} className="text-[10px] sticky top-0 z-10"
                   style={{ height: V_ROW_H, overflow: 'hidden', textOverflow: 'ellipsis' }}>
                 {c.label}
               </th>
             ))}
+            {rightPad > 0 && <th aria-hidden className="sticky top-0 z-10" style={{ padding: 0, border: 0 }} />}
           </tr>
         </thead>
         <tbody>
           {padTop > 0 && (
             <tr aria-hidden style={{ height: padTop }}>
-              <td colSpan={cols.length} style={{ padding: 0, border: 0, height: padTop }} />
+              <td colSpan={visCols.length + (leftPad > 0 ? 1 : 0) + (rightPad > 0 ? 1 : 0)}
+                  style={{ padding: 0, border: 0, height: padTop }} />
             </tr>
           )}
           {visible.map((row, i) => (
-            <tr key={start + i} style={{ height: V_ROW_H }}>
-              {cols.map((col, ci) => (
-                <td key={ci} style={cellStyle}>{renderCell(col, row[col.key])}</td>
-              ))}
-            </tr>
+            <VirtualRow key={start + i} row={row} visCols={visCols}
+                        leftPad={leftPad} rightPad={rightPad} />
           ))}
           {padBottom > 0 && (
             <tr aria-hidden style={{ height: padBottom }}>
-              <td colSpan={cols.length} style={{ padding: 0, border: 0, height: padBottom }} />
+              <td colSpan={visCols.length + (leftPad > 0 ? 1 : 0) + (rightPad > 0 ? 1 : 0)}
+                  style={{ padding: 0, border: 0, height: padBottom }} />
             </tr>
           )}
         </tbody>
@@ -165,7 +266,18 @@ function todayDMY() {
 
 // Report types hidden from the Equipment Type dropdown (backend mapping is left
 // intact — these are only removed from the picker, order of the rest unchanged).
-const HIDDEN_EQ_TYPES = new Set(['Alarms', 'Tracker', 'Temperature Report', 'Daily Generation'])
+// 'Tracker' is now the visible, operator-facing merge of the isolation devices, so it
+// is NOT hidden. The raw isolation types and the retired MBOX report are hidden here as
+// a belt-and-suspenders guard (the backend already omits them from /equipment-types).
+const HIDDEN_EQ_TYPES = new Set([
+  'Alarms', 'Temperature Report', 'Daily Generation',
+  'T1 Isolation', 'T2 Isolation', 'Tracker MBOX Status',
+])
+
+// The equipment type that carries the T1/T2 isolation devices (shown as Tracker{n}).
+// Centralised so the isolation-specific UI behaviours (column ordering, export routing)
+// key off one predicate instead of scattered string comparisons.
+const isTrackerType = (t) => t === 'Tracker'
 
 // Multi-equipment table uses classic server-side pagination: the first page loads
 // with progress; Prev/Next fetch one page at a time (rows ordered by timestamp then
@@ -325,7 +437,7 @@ function EquipmentMultiSelect({ eqList, selectedIds, setSelectedIds, disabled, l
               {selectedIds.has(eq.equipment_id) && '✓'}
             </div>
             <span className="text-[12px] text-ge-text1 flex-1 leading-tight truncate">
-              {eq.display_name}
+              {trackerDisplayName(eq.display_name)}
             </span>
           </div>
         ))}
@@ -371,29 +483,22 @@ function EquipmentMultiSelect({ eqList, selectedIds, setSelectedIds, disabled, l
   )
 }
 
-// ── Tag Selector (range selection removed — now on Equipment) ──────────────────
-function DynamicTagSelector({ tags, selected, setSelected }) {
-  const [query,  setQuery]  = useState('')
-  const [sorted, setSorted] = useState(false)
-
+// ── Tag Selector (READ-ONLY) ──────────────────────────────────────────────────
+// Same layout/styling as before, but the panel is view-only: every available tag
+// is auto-selected upstream and shown in both lists; search, sort, Clear All and
+// every tag checkbox are disabled, so the user can inspect the selection but never
+// change it. `selected` is driven entirely by the parent's auto-select effect.
+function DynamicTagSelector({ tags, selected }) {
   const tagIndex = useMemo(() => {
     const map = {}
     tags.forEach((t, i) => { map[t.column_name] = i + 1 })
     return map
   }, [tags])
 
-  const displayed = useMemo(() => {
-    let list = sorted ? [...tags].sort((a, b) => a.tag.localeCompare(b.tag)) : tags
-    return list.filter(t => t.tag.toLowerCase().includes(query.toLowerCase()))
-  }, [tags, query, sorted])
+  // Read-only → no filtering/sorting is possible, so every tag is always shown.
+  const displayed = tags
 
-  // Only fully-available tags are selectable; partial ones are shown but locked.
-  const isAvail   = t => t.available !== false
-  const toggle    = col => setSelected(prev => {
-    const s = new Set(prev); s.has(col) ? s.delete(col) : s.add(col); return s
-  })
-  const clearAll  = () => setSelected(new Set())
-
+  const isAvail = t => t.available !== false
   const availableCount = useMemo(() => tags.filter(isAvail).length, [tags])
   const partialCount   = tags.length - availableCount
 
@@ -406,21 +511,21 @@ function DynamicTagSelector({ tags, selected, setSelected }) {
         <span className="text-[10px] font-mono text-ge-accent">{selected.size} selected</span>
       </div>
 
-      {/* Search + Sort */}
+      {/* Search + Sort — rendered exactly as before, but disabled (read-only). */}
       <div className="flex items-center gap-2 mb-2">
         <div className="relative flex-1">
           <span className="absolute left-2.5 top-1/2 -translate-y-1/2 text-ge-text3 text-sm">🔍</span>
-          <input type="text" value={query} onChange={e => setQuery(e.target.value)}
+          <input type="text" value="" readOnly disabled
             placeholder="Search tags..." className="form-control pl-7 text-[12px]" />
         </div>
-        <button className="btn btn-outline btn-sm" onClick={() => setSorted(s => !s)}>
-          {sorted ? 'Default' : 'A→Z'}
+        <button className="btn btn-outline btn-sm" disabled>
+          A→Z
         </button>
       </div>
 
-      {/* Quick actions — no bulk "Select All"; tags are chosen individually. */}
+      {/* Quick actions — Clear All disabled (selection cannot be modified). */}
       <div className="flex items-center gap-2 mb-2.5 flex-wrap">
-        <button className="btn btn-outline btn-sm" onClick={clearAll}>✕ Clear All</button>
+        <button className="btn btn-outline btn-sm" disabled>✕ Clear All</button>
         <span className="ml-auto text-[11px] text-ge-text3 font-mono">
           Showing: {displayed.length}
         </span>
@@ -434,7 +539,7 @@ function DynamicTagSelector({ tags, selected, setSelected }) {
         </div>
       )}
 
-      {/* Tag lists */}
+      {/* Tag lists — display only; no click/keyboard interaction. */}
       <div className="grid grid-cols-2 gap-2.5">
         {/* Available */}
         <div>
@@ -451,11 +556,10 @@ function DynamicTagSelector({ tags, selected, setSelected }) {
                 const isSel = selected.has(tag.column_name)
                 return (
                 <div key={tag.column_name}
-                  onClick={() => avail && toggle(tag.column_name)}
                   title={avail ? '' : `Available in ${tag.available_in} of ${tag.total} selected equipment`}
-                  className={`flex items-center gap-2 px-2 py-1.5
-                             border-b border-ge-border last:border-b-0 transition-colors
-                             ${avail ? 'cursor-pointer hover:bg-ge-surface' : 'cursor-not-allowed opacity-50'}
+                  className={`flex items-center gap-2 px-2 py-1.5 cursor-default select-none
+                             border-b border-ge-border last:border-b-0
+                             ${avail ? '' : 'opacity-50'}
                              ${isSel ? 'bg-ge-blue/10' : ''}`}>
                   <span className="text-[9px] font-mono text-ge-text3 w-5 text-right flex-shrink-0">
                     {tagIndex[tag.column_name]}
@@ -495,10 +599,9 @@ function DynamicTagSelector({ tags, selected, setSelected }) {
               : [...selected].map(col => {
                   const tag = tags.find(t => t.column_name === col) || { tag: col, unit: '' }
                   return (
-                    <div key={col} onClick={() => toggle(col)}
-                      className="flex items-center gap-2 px-2.5 py-1.5 cursor-pointer
-                                 border-b border-ge-border last:border-b-0 transition-colors
-                                 hover:bg-ge-surface bg-ge-blue/10">
+                    <div key={col}
+                      className="flex items-center gap-2 px-2.5 py-1.5 cursor-default select-none
+                                 border-b border-ge-border last:border-b-0 bg-ge-blue/10">
                       <div className="w-3.5 h-3.5 rounded flex items-center justify-center
                                       text-[9px] flex-shrink-0 bg-ge-blue border border-ge-blue text-white">
                         ✓
@@ -543,6 +646,7 @@ export default function Reports() {
   const [loadingExport, setLoadingExport] = useState(false)
   const [exportLabel,   setExportLabel]   = useState('')
   const [exportJob,     setExportJob]     = useState(null)  // { pct, message, status }
+  const [savedLocation, setSavedLocation] = useState(null)  // absolute path of last saved export
   const [loadJob,       setLoadJob]       = useState(null)  // { pct, message, status }
   const esRef     = useRef(null)
   const loadEsRef = useRef(null)
@@ -862,7 +966,7 @@ export default function Reports() {
         ? `All_${eqType}_Equipment`
         : selectedEqIds.size > 1
           ? `${selectedEqIds.size}_Equipment`
-          : primaryEqId
+          : trackerDisplayName(primaryEqId)   // Tracker{n} for the merged type; unchanged otherwise
       const filename = `${filePrefix}_Report_${todayDMY()}.${ext}`
       // Anchor MUST be in the DOM and the blob URL must NOT be revoked synchronously —
       // revoking too early aborts the download in most browsers.
@@ -1007,6 +1111,49 @@ export default function Reports() {
     }
   }
 
+  // Direct-to-Downloads export (T1/T2 Isolation): the backend builds each device
+  // report in parallel and saves each .xlsx straight into the Downloads folder as it
+  // finishes — no ZIP, no browser download. We only start the job and show live
+  // progress ("Saved ISO13_Report.xlsx …") over the existing SSE stream.
+  const runToDownloadsExport = async () => {
+    setLoadingExport(true); setExportLabel('Excel'); setSavedLocation(null)
+    setExportJob({ pct: 0, message: 'Preparing export…', status: 'running' })
+    try {
+      const payload = buildPayload(1, 10000)
+      console.log(`[Export] to-Downloads — ${payload.equipment_ids.length} equipment:`, payload.equipment_ids)
+      const { job_id } = await startExcelToDownloads(payload)
+
+      const es = new EventSource(exportProgressUrl(job_id))
+      esRef.current = es
+      es.onmessage = (evt) => {
+        let d; try { d = JSON.parse(evt.data) } catch { return }
+        setExportJob({ pct: d.progress ?? 0, message: d.message || '', status: d.status })
+        if (d.status === 'done') {
+          es.close(); esRef.current = null
+          setExportJob(null); setLoadingExport(false); setExportLabel('')
+          // The backend message ends with the absolute save path — surface it and
+          // keep it visible so the user knows exactly where the files landed.
+          const savedPath = (d.json_result && (d.json_result.path || d.json_result.directory))
+            || (d.message || '').replace(/^Saved .*? to /, '') || null
+          setSavedLocation(savedPath)
+          showToast(d.message || 'Reports saved to Downloads')
+        } else if (d.status === 'error') {
+          es.close(); esRef.current = null
+          setExportJob(null); setLoadingExport(false); setExportLabel('')
+          showToast(`Export failed: ${d.message || 'unknown error'}`)
+        }
+      }
+      es.onerror = () => {
+        es.close(); esRef.current = null
+        setExportJob(null); setLoadingExport(false); setExportLabel('')
+      }
+    } catch (e) {
+      console.error('[Export] to-Downloads failed to start:', e)
+      showToast(`Export failed: ${e.message}`)
+      setExportJob(null); setLoadingExport(false); setExportLabel('')
+    }
+  }
+
   // Clean up any open SSE connections on unmount.
   useEffect(() => () => {
     if (esRef.current) esRef.current.close()
@@ -1016,13 +1163,15 @@ export default function Reports() {
   const handleExportCSV   = () => handleDownload(exportReportCSVV2,   'csv',  10000, 'CSV')
   const handleExportExcel = () => {
     // Export routing (no data preload required — all stream from the backend):
-    //  · T1/T2 Isolation (any count)→ single-request STREAMING export (one workbook
-    //                                 per device, zipped if >1) straight to disk
-    //  · String Combiner (any count)→ async job (one worksheet per SMB)
+    //  · Tracker (T1/T2 Isolation) → direct-to-Downloads: each device report is built
+    //                                in parallel and saved into a single timestamped
+    //                                folder (Downloads\Tracker_Reports_<ts>\Tracker{n}.xlsx)
+    //  · String Combiner           → direct-to-Downloads: one INV{n}.xlsx per inverter,
+    //                                all inside Downloads\SMB_Reports_<ts>\ (NO ZIP)
     //  · any multi-equipment select → async job (one worksheet per equipment)
     // Single-equipment (1 sheet) stays synchronous.
-    if ((eqType === 'T1 Isolation' || eqType === 'T2 Isolation') && selectedEqIds.size > 0) return runStreamingExport()
-    if (eqType === 'String Combiner')                        return runAsyncExport()
+    if (isTrackerType(eqType) && selectedEqIds.size > 0) return runToDownloadsExport()
+    if (eqType === 'String Combiner' && selectedEqIds.size > 0) return runToDownloadsExport()
     if (selectedEqIds.size > 1)                              return runAsyncExport()
     return handleDownload(exportReportExcelV2, 'xlsx', 10000, 'Excel')
   }
@@ -1041,7 +1190,18 @@ export default function Reports() {
   // still holds the complete data.
   const tableCols = useMemo(() => {
     if (!result?.columns) return []
-    return result.columns.map(col => {
+    let columns = result.columns
+    // For T1/T2 Isolation, reorder the TAG columns to the ID-grouped order that the
+    // Excel export uses, so the grid and the workbook are identical. Timestamp (and
+    // the merged-view Equipment column) keep their leading positions; only the tag
+    // columns are regrouped. Data cells follow automatically (they are keyed by
+    // column name), so sorting/filtering/pagination/virtualization are unaffected.
+    if (isTrackerType(eqType)) {
+      const lead = columns.filter(c => c === '_equipment' || c === 'timestamp')
+      const tags = columns.filter(c => c !== '_equipment' && c !== 'timestamp')
+      columns = [...lead, ...orderIsolationColumns(tags)]
+    }
+    return columns.map(col => {
       if (col === '_equipment') return { key: col, label: 'Equipment', isTs: false }
       if (col === 'timestamp')  return { key: col, label: 'Timestamp (DD/MM/YYYY HH:MM:SS)', isTs: true }
       const meta = tagLookup[col]
@@ -1052,7 +1212,7 @@ export default function Reports() {
       const label = col.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase())
       return { key: col, label, isTs: false }
     })
-  }, [result?.columns, tagLookup])
+  }, [result?.columns, tagLookup, eqType])
 
   const tableRows = useMemo(() => {
     const rows = result?.rows || []
@@ -1182,7 +1342,7 @@ export default function Reports() {
                   <span key={id}
                     className="inline-flex items-center gap-1 px-2 py-0.5 rounded
                                bg-ge-blue/20 border border-ge-blue/40 text-ge-blue text-[11px] font-mono">
-                    {id}
+                    {trackerDisplayName(id)}
                     <button
                       onClick={() => setSelectedEqIds(prev => {
                         const s = new Set(prev); s.delete(id); return s
@@ -1205,14 +1365,16 @@ export default function Reports() {
         )}
       </div>
 
-      {/* Tag Selection */}
+      {/* Tag Selection — READ-ONLY. Every available tag is auto-selected and shown
+          in both lists exactly as before; all interactions are disabled so the user
+          can view but not modify the selection. */}
       <div className="card mb-3">
         {loadingTags ? (
           <div className="flex items-center gap-2 py-6 text-ge-text3 text-[12px]">
             <Spinner size={14} /> Loading tags from database...
           </div>
         ) : tagList.length > 0 ? (
-          <DynamicTagSelector tags={tagList} selected={selected} setSelected={setSelected} />
+          <DynamicTagSelector tags={tagList} selected={selected} />
         ) : eqType ? (
           <div className="text-[12px] text-ge-text3 py-4 text-center">
             {selectedEqIds.size > 0 ? 'No tags found' : 'Select Equipment Identifier to load tags'}
@@ -1285,7 +1447,7 @@ export default function Reports() {
           {result && (
             <div className="ml-auto flex items-center gap-3">
               <span className="text-[11px] font-mono text-ge-text3">
-                {result.table_name} · {INTERVAL_LABELS[result.interval] || result.interval}
+                {trackerDisplayName(result.table_name)} · {INTERVAL_LABELS[result.interval] || result.interval}
               </span>
             </div>
           )}
@@ -1304,6 +1466,22 @@ export default function Reports() {
               <div className="h-full bg-ge-accent transition-all duration-300"
                 style={{ width: `${exportJob.pct}%` }} />
             </div>
+          </div>
+        )}
+
+        {/* Persistent saved-location line — shows the REAL absolute path on disk. */}
+        {!exportJob && savedLocation && (
+          <div className="mt-3 pt-3 border-t border-ge-border flex items-start gap-2">
+            <span className="text-ge-accent text-[13px] leading-none mt-0.5">✓</span>
+            <div className="flex-1 min-w-0">
+              <div className="text-[11px] text-ge-text2">Saved to:</div>
+              <div className="text-[12px] font-mono text-ge-text1 break-all">{savedLocation}</div>
+            </div>
+            <button
+              onClick={() => setSavedLocation(null)}
+              className="text-[11px] text-ge-text3 hover:text-ge-danger leading-none"
+              title="Dismiss"
+            >×</button>
           </div>
         )}
       </div>

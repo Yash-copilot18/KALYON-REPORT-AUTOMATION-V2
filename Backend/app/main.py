@@ -62,8 +62,29 @@ async def lifespan(app: FastAPI):
     from app.services import email_service
     email_service.log_startup_status()
 
+    # Scheduled Reports now supports only DGR / MGR / YGR. Mark any schedule of a
+    # now-removed report type as Paused (kept in the DB, hidden from the UI, never run).
+    try:
+        from app.services import schedule_service
+        from app.database.session import SessionLocal
+        with SessionLocal() as _db:
+            schedule_service.deactivate_unsupported_schedules(_db)
+    except Exception as e:  # noqa: BLE001 — never block startup on this cleanup
+        logger.error("Schedule cleanup failed: %s", e, exc_info=True)
+
+    # Background scheduler for automatic report delivery. Guarded so only one
+    # process runs it (safe under uvicorn --reload / multiple workers).
+    from app.services import scheduler
+    try:
+        scheduler.start_scheduler()
+    except Exception as e:  # noqa: BLE001 — never block startup on the scheduler
+        logger.error("Failed to start scheduler: %s", e, exc_info=True)
+
     logger.info("Application startup complete. Ready to accept requests.")
     yield
+
+    from app.services import scheduler as _sched
+    _sched.stop_scheduler()
 
     from app.database.session import engine as eng
     logger.info("Shutting down — disposing database connection pool.")

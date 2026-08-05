@@ -78,6 +78,11 @@ export const REPORT_PRESETS = {
     equipment: 'all', interval: 'hourly', agg: 'avg', format: 'Excel', tags: 'all',
     note: 'All T2 isolation devices · hourly averages',
   },
+  // Operator-facing merge of T1 + T2 Isolation (devices shown as Tracker1…Tracker24).
+  'Tracker': {
+    equipment: 'all', interval: 'hourly', agg: 'avg', format: 'Excel', tags: 'all',
+    note: 'All tracker devices · hourly averages',
+  },
 }
 
 // The report types offered as preconfigured templates, in dropdown order.

@@ -8,3 +8,5 @@ python-dotenv
 alembic
 openpyxl
 XlsxWriter
+reportlab
+APScheduler

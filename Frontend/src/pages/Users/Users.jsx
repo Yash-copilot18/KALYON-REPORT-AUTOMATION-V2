@@ -80,21 +80,6 @@ export default function Users() {
         </button>
       </PageHeader>
 
-      {/* Stats */}
-      <div className="grid grid-cols-4 gap-3 mb-4">
-        {[
-          { l:'Total Users', v: allUsers.length,                              c:'blue'  },
-          { l:'Active Now',  v: allUsers.filter(u => u.active).length,        c:'green' },
-          { l:'Admins',      v: allUsers.filter(u => u.role === 'Admin').length,    c:'red'   },
-          { l:'Engineers',   v: allUsers.filter(u => u.role === 'Engineer').length, c:'amber' },
-        ].map(({ l, v, c }) => (
-          <div key={l} className={`kpi-card kpi-${c}`}>
-            <div className="font-mono text-[10px] text-ge-text3 uppercase tracking-widest mb-1">{l}</div>
-            <div className="font-mono text-2xl font-semibold text-ge-text1">{v}</div>
-          </div>
-        ))}
-      </div>
-
       <div className="card">
         <div className="card-title justify-between">
           <span>Platform Users</span>

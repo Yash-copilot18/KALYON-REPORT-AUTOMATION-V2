@@ -273,11 +273,16 @@ class ReportsService:
         offset: int, limit: int,
     ) -> List[Tuple[object, int]]:
         """
-        The page's (timestamp, device-ordinal) pairs in (timestamp, equipment) order.
+        The page's (timestamp, device-ordinal) pairs in (equipment, timestamp) order.
         Built from a UNION-ALL of per-device interval-key selects — this touches only
         TimeCol (clustered index) and groups on the key, so it is cheap even across
         all devices, and paginates with OFFSET/FETCH. `ordinal` indexes `active_ids`
-        (selection order), so the equipment sort follows the user's selection.
+        (selection order), so equipment blocks appear in the user's selection order.
+
+        Ordering is (equipment-ordinal, timestamp): each device's rows form one
+        continuous block, timestamps ascending within the block, and the blocks
+        follow the selection order — the report reads one equipment at a time rather
+        than interleaving devices at each timestamp.
         """
         if not active_ids:
             return []
@@ -296,7 +301,7 @@ class ReportsService:
             return []
         union = " UNION ALL ".join(parts)
         sql = (f"SELECT ts, eord FROM ({union}) u "
-               f"ORDER BY ts, eord OFFSET :off ROWS FETCH NEXT :lim ROWS ONLY")
+               f"ORDER BY eord, ts OFFSET :off ROWS FETCH NEXT :lim ROWS ONLY")
         db = SessionLocal()
         try:
             rows = db.execute(text(sql),
@@ -313,16 +318,19 @@ class ReportsService:
     ) -> Dict:
         """
         Return ONE global page of the merged multi-equipment view, ordered by
-        (timestamp, equipment) so EVERY selected device appears on each page (not
-        just the first). Pagination is fully server-side:
+        (equipment, timestamp): each selected device appears as ONE continuous block
+        (timestamps ascending within it) and the blocks follow the selection order,
+        so the report never interleaves devices. Pagination is fully server-side:
 
           1. per-device row counts (cached) → `total_records` and progress,
-          2. a cheap keys query → this page's exact (timestamp, device) pairs,
-          3. aggregate ONLY the page's narrow time window, per device, in parallel,
-          4. assemble the rows in (timestamp, equipment) order.
+          2. a cheap keys query → this page's exact (device, timestamp) pairs,
+          3. aggregate ONLY each device's narrow page window, in parallel,
+          4. assemble the rows in (equipment, timestamp) order.
 
         Only ~`page_size` rows ever leave the DB, so it stays fast for hundreds of
-        thousands of records and the browser never holds the whole dataset.
+        thousands of records and the browser never holds the whole dataset. Because a
+        device's rows can span many pages, one equipment's block may continue across
+        page boundaries — the blocks still never interleave.
         """
         ids = [e for e in equipment_ids if e and str(e).strip()]
         if not ids:
@@ -350,22 +358,36 @@ class ReportsService:
                  if offset < total else [])
 
         if pairs:
-            # Narrow global time window covering exactly this page.
-            w_start = min(p[0] for p in pairs)
-            w_end   = max(p[0] for p in pairs)
-            w_start_s = w_start.strftime("%Y-%m-%d %H:%M:%S")
-            w_end_s   = w_end.strftime("%Y-%m-%d %H:%M:%S")
-            page_devices = sorted({o for _, o in pairs})   # ordinals present on this page
+            # Group the page's timestamps PER DEVICE. With (equipment, timestamp)
+            # ordering a single page is one device's continuous block (or, at a block
+            # boundary, the tail of one device plus the head of the next) — it is no
+            # longer a narrow GLOBAL time window, so each device is fetched in its OWN
+            # [min, max] window. That window contains exactly this device's page rows,
+            # keeping every fetch narrow and correct (a single global window would let
+            # one device's early rows push its needed tail rows past the row limit).
+            dev_page_ts: Dict[int, List[object]] = {}
+            for ts, o in pairs:
+                dev_page_ts.setdefault(o, []).append(ts)
 
             def fetch_window(o):
                 eid = active_ids[o]
+                tss = dev_page_ts[o]
+                # Lower bound = this device's first page bucket (skips earlier buckets
+                # on later pages). Upper bound = the ORIGINAL request end, NOT max(tss):
+                # a bucket keyed e.g. 11:00 spans forward to 11:14, so capping at the
+                # bucket KEY would under-aggregate that last bucket. Buckets are grouped
+                # independently, so widening the upper bound never changes the value of
+                # any earlier bucket — it only lets the final bucket aggregate its full
+                # span, exactly matching a direct per-device query. The row limit keeps
+                # the fetch narrow: only this device's page buckets (+1) are read.
+                w_start_s = min(tss).strftime("%Y-%m-%d %H:%M:%S")
                 db = SessionLocal()
                 try:
                     r = ReportsRepository.get_report_data(
                         db=db, equipment_type=req.equipment_type, equipment_id=eid,
-                        tags=column_names, from_datetime=w_start_s, to_datetime=w_end_s,
+                        tags=column_names, from_datetime=w_start_s, to_datetime=to_dt,
                         interval=interval, agg_function=agg,
-                        page=1, page_size=page_size + len(active_ids), compute_total=False,
+                        page=1, page_size=len(tss) + 1, compute_total=False,
                     )
                     return o, r
                 finally:
@@ -373,7 +395,7 @@ class ReportsService:
 
             dev_maps: Dict[int, Dict[str, dict]] = {}
             with ThreadPoolExecutor(max_workers=_BATCH_WORKERS) as ex:
-                for o, r in ex.map(fetch_window, page_devices):
+                for o, r in ex.map(fetch_window, dev_page_ts.keys()):
                     if columns is None and r.get("columns"):
                         columns = r["columns"]
                     dev_maps[o] = {row["timestamp"]: row for row in r.get("rows", [])}

@@ -283,16 +283,67 @@ function MiniBar({ data, xKey, yKey, name, color = C.blue, unit = '' }) {
 }
 // ── Inverter-wise generation treemap (DGR) ───────────────────────────────────
 // One rectangle per inverter, area proportional to the kWh it generated on the
-// selected date. Colour intensity tracks the same value, so the biggest producers
-// read as the brightest blocks.
+// selected date. Colour encodes PERFORMANCE relative to the fleet average on a
+// red→yellow→green (RdYlGn) traffic-light ramp, so the best and worst performers
+// are identifiable at a glance without reading a single value.
 const fmtKwh = v => Number(v || 0).toLocaleString(undefined, { maximumFractionDigits: 1 })
 const fmtMw  = v => (v === null || v === undefined ? '—' : `${Number(v).toFixed(2)} MW`)
 
-// Accent hue, lightness ramped 24% → 58% with the inverter's share of the best
-// performer, so "brighter = more generation" is readable at a glance.
-const treemapFill = (value, maxValue) => {
-  const t = maxValue > 0 ? Math.min(Math.max(value / maxValue, 0), 1) : 0
-  return `hsl(168, 72%, ${Math.round(24 + t * 34)}%)`
+// Performance colour scale (RdYlGn, red→green). Anchored on the fleet AVERAGE:
+//   red  = lowest / offline · orange = below avg · yellow = average
+//   light green = above avg · dark green = highest
+// Below-average values ramp red→orange→yellow; above-average ramp yellow→green.
+const PERF_RAMP = [
+  [0.00, [198, 40, 40]],   // #c62828 red  — lowest / offline
+  [0.25, [245, 124, 0]],   // #f57c00 orange — below average
+  [0.50, [253, 216, 53]],  // #fdd835 yellow — average
+  [0.75, [124, 179, 66]],  // #7cb342 light green — above average
+  [1.00, [27, 122, 60]],   // #1b7a3c dark green — highest
+]
+
+// Value → position on the ramp, with 0.5 pinned to the fleet average so "yellow =
+// average" holds regardless of how the spread sits between min and max. Zero (or
+// missing) generation is treated as offline → the red end.
+const perfPosition = (value, { min, max, avg }) => {
+  if (!(value > 0)) return 0
+  if (value >= avg) {
+    const span = max - avg
+    return 0.5 + 0.5 * (span > 0 ? Math.min((value - avg) / span, 1) : 1)
+  }
+  const span = avg - min
+  return 0.5 * (span > 0 ? Math.max((value - min) / span, 0) : 0)
+}
+
+const _lerp = (a, b, f) => Math.round(a + (b - a) * f)
+
+// Fill + readable text colour for a tile, from its performance position.
+const tileColors = (value, perf) => {
+  const t = Math.min(Math.max(perfPosition(value, perf), 0), 1)
+  let rgb = PERF_RAMP[PERF_RAMP.length - 1][1]
+  for (let i = 1; i < PERF_RAMP.length; i++) {
+    if (t <= PERF_RAMP[i][0]) {
+      const [t0, c0] = PERF_RAMP[i - 1]
+      const [t1, c1] = PERF_RAMP[i]
+      const f = (t - t0) / ((t1 - t0) || 1)
+      rgb = [_lerp(c0[0], c1[0], f), _lerp(c0[1], c1[1], f), _lerp(c0[2], c1[2], f)]
+      break
+    }
+  }
+  // Relative luminance → dark ink on light (yellow/light-green) tiles, light ink
+  // on dark (red/orange/dark-green) tiles, so labels stay legible on every colour.
+  const L = 0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]
+  return { fill: `rgb(${rgb[0]}, ${rgb[1]}, ${rgb[2]})`, text: L > 150 ? '#10151f' : '#f6f9fc' }
+}
+
+// Short performance category for the tooltip, so a hover names the ranking too.
+const perfLabel = (value, perf) => {
+  if (!(value > 0)) return 'Offline'
+  const t = perfPosition(value, perf)
+  if (t >= 0.9)  return 'Highest'
+  if (t > 0.55)  return 'Above average'
+  if (t >= 0.45) return 'Average'
+  if (t > 0.1)   return 'Below average'
+  return 'Lowest'
 }
 
 // Only fields the database actually returned are shown. Peak Power comes from
@@ -302,12 +353,23 @@ function TreemapTooltip({ active, payload }) {
   if (!active || !payload?.length) return null
   const d = payload[0]?.payload
   if (!d?.name) return null
+  const swatch = d.perf ? tileColors(d.generation, d.perf).fill : C.accent
   return (
     <div style={{ ...TOOLTIP_STYLE, padding: '7px 10px', lineHeight: 1.6 }}>
       <div style={{ color: C.accent, fontWeight: 600, marginBottom: 2 }}>{d.name}</div>
       <div style={{ color: C.text3 }}>
-        Total Generation: <span style={{ color: '#dbe3f0' }}>{fmtKwh(d.generation)} kWh</span>
+        Total Generation:{' '}
+        <span style={{ color: '#dbe3f0' }}>
+          {Number(d.generation || 0).toLocaleString(undefined, { maximumFractionDigits: 3 })} kWh
+        </span>
       </div>
+      {d.perf && (
+        <div style={{ color: C.text3, display: 'flex', alignItems: 'center', gap: 6 }}>
+          Performance:
+          <span style={{ display: 'inline-block', width: 9, height: 9, borderRadius: 2, background: swatch }} />
+          <span style={{ color: '#dbe3f0' }}>{perfLabel(d.generation, d.perf)}</span>
+        </div>
+      )}
       {d.peak !== null && d.peak !== undefined && (
         <div style={{ color: C.text3 }}>
           Peak Power: <span style={{ color: '#dbe3f0' }}>{fmtMw(d.peak)}</span>
@@ -317,31 +379,30 @@ function TreemapTooltip({ active, payload }) {
   )
 }
 
-// Rectangle renderer: fill by intensity, and print the inverter name + kWh when
-// the block is big enough for the text to actually fit.
+// Rectangle renderer: fill by performance, and print the inverter name + kWh when
+// the block is big enough for the text to actually fit. Label ink flips dark/light
+// with tile luminance so it stays readable across the whole red→green ramp.
 function TreemapCell(props) {
-  const { x, y, width, height, name, generation, maxValue } = props
+  const { x, y, width, height, name, generation, perf } = props
   if (!name || width <= 0 || height <= 0) return null
-  const showName  = width > 46 && height > 24
-  const showValue = width > 62 && height > 38
+  const showName  = width > 46 && height > 26
+  const showValue = width > 64 && height > 42
+  const { fill, text } = tileColors(generation, perf || {})
   return (
     <g>
       <rect
         x={x} y={y} width={width} height={height}
-        style={{
-          fill: treemapFill(generation, maxValue),
-          stroke: '#0d1220', strokeWidth: 2, cursor: 'pointer',
-        }}
+        style={{ fill, stroke: '#0d1220', strokeWidth: 2, cursor: 'pointer' }}
       />
       {showName && (
-        <text x={x + width / 2} y={y + height / 2 + (showValue ? -4 : 4)}
-          textAnchor="middle" fill="#0d1220" fontSize={11} fontWeight={700}>
+        <text x={x + width / 2} y={y + height / 2 + (showValue ? -5 : 5)}
+          textAnchor="middle" fill={text} fontSize={14} fontWeight={800}>
           {name}
         </text>
       )}
       {showValue && (
-        <text x={x + width / 2} y={y + height / 2 + 12}
-          textAnchor="middle" fill="#0d1220" fontSize={10} fontFamily="monospace">
+        <text x={x + width / 2} y={y + height / 2 + 13}
+          textAnchor="middle" fill={text} fontSize={12} fontFamily="monospace" fontWeight={600}>
           {fmtKwh(generation)} kWh
         </text>
       )}
@@ -349,23 +410,52 @@ function TreemapCell(props) {
   )
 }
 
+// Colour-scale legend — makes the red→yellow→green performance ramp explicit so a
+// tile's colour is never the only cue to its meaning.
+function TreemapLegend() {
+  return (
+    <div className="flex items-center gap-2 px-1 pt-2 select-none">
+      <span className="text-[10px] font-semibold text-ge-text2 whitespace-nowrap">Low</span>
+      <div className="relative flex-1 h-2.5 rounded"
+        style={{ background: 'linear-gradient(to right, #c62828, #f57c00, #fdd835, #7cb342, #1b7a3c)' }} />
+      <span className="text-[10px] font-semibold text-ge-text2 whitespace-nowrap">High</span>
+      <span className="ml-2 text-[10px] font-mono text-ge-text3 whitespace-nowrap">
+        Red = Lowest · Yellow = Average · Dark Green = Highest
+      </span>
+    </div>
+  )
+}
+
 function InverterTreemap({ data }) {
-  const maxValue = useMemo(
-    () => data.reduce((a, d) => Math.max(a, d.generation || 0), 0), [data])
-  // maxValue rides along on each node so the cell renderer can scale its colour.
-  const nodes = useMemo(
-    () => data.map(d => ({ ...d, maxValue })), [data, maxValue])
+  // Fleet performance stats (min / max / average over the producing inverters).
+  // The average anchors the colour ramp's midpoint; offline units (0 kWh) still
+  // count in the fleet so the scale reflects real spread.
+  const perf = useMemo(() => {
+    const vals = data.map(d => d.generation || 0)
+    const max  = vals.reduce((a, v) => Math.max(a, v), 0)
+    const min  = vals.reduce((a, v) => Math.min(a, v), max)
+    const avg  = vals.length ? vals.reduce((a, v) => a + v, 0) / vals.length : 0
+    return { min, max, avg }
+  }, [data])
+
+  // perf rides along on each node so the cell renderer + tooltip can colour it.
+  const nodes = useMemo(() => data.map(d => ({ ...d, perf })), [data, perf])
 
   return (
-    <ResponsiveContainer width="100%" height="100%">
-      <Treemap
-        data={nodes} dataKey="generation" nameKey="name"
-        stroke="#0d1220" isAnimationActive={false}
-        content={<TreemapCell />}
-      >
-        <Tooltip content={<TreemapTooltip />} />
-      </Treemap>
-    </ResponsiveContainer>
+    <div className="h-full flex flex-col">
+      <div className="flex-1 min-h-0">
+        <ResponsiveContainer width="100%" height="100%">
+          <Treemap
+            data={nodes} dataKey="generation" nameKey="name"
+            stroke="#0d1220" isAnimationActive={false}
+            content={<TreemapCell />}
+          >
+            <Tooltip content={<TreemapTooltip />} />
+          </Treemap>
+        </ResponsiveContainer>
+      </div>
+      <TreemapLegend />
+    </div>
   )
 }
 
@@ -879,8 +969,13 @@ export default function DGRReports() {
       <PageHeader
         title="Generation Reports"
       >
-        <button className="btn btn-outline btn-sm" onClick={() => doExport(exportCSV, 'CSV')} disabled={loading || pdfBusy}>📊 CSV</button>
-        <button className="btn btn-outline btn-sm" onClick={() => doExport(exportExcel, 'Excel')} disabled={loading || pdfBusy}>📗 Excel</button>
+        {/* DGR exports PDF only (client requirement); MGR/YGR keep CSV + Excel. */}
+        {type !== 'DGR' && (
+          <button className="btn btn-outline btn-sm" onClick={() => doExport(exportCSV, 'CSV')} disabled={loading || pdfBusy}>📊 CSV</button>
+        )}
+        {type !== 'DGR' && (
+          <button className="btn btn-outline btn-sm" onClick={() => doExport(exportExcel, 'Excel')} disabled={loading || pdfBusy}>📗 Excel</button>
+        )}
         <button className="btn btn-primary btn-sm" onClick={exportPdf} disabled={loading || pdfBusy}>
           {pdfBusy ? <><Spinner size={12} /> PDF…</> : '📄 PDF'}
         </button>

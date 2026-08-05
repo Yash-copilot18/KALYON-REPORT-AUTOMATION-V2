@@ -3,26 +3,28 @@ import React, { useState, useMemo, useEffect } from 'react'
 import { PageHeader, Spinner } from '../../components/Common'
 import { useApp } from '../../utils/AppContext'
 import {
-  fetchScheduledEmailConfig, sendScheduledEmail, sendTestEmail,
-  fetchReportEquipmentList,
+  fetchScheduledEmailConfig, sendTestEmail, fetchReportEquipmentList,
+  fetchSchedules, createSchedule, updateSchedule, deleteSchedule,
+  runSchedule, pauseSchedule, resumeSchedule, fetchScheduleRuns,
 } from '../../services/api'
 import {
   INTERVALS, INTERVAL_LABELS, AGG_OPTIONS, DEFAULT_AGG,
-  showsAggregation, withAggregation,
+  showsAggregation,
 } from '../../utils/intervals'
-import { PRESET_TYPES, getPreset, presetEquipmentIds } from '../../utils/reportPresets'
+import { getPreset, presetEquipmentIds } from '../../utils/reportPresets'
 
 const FREQ_OPTIONS   = ['Daily', 'Weekly', 'Monthly']
-const FORMAT_OPTIONS = ['CSV', 'Excel']
+const FORMAT_OPTIONS = ['Excel', 'PDF']
 
 function todayStr() {
   return new Date().toISOString().slice(0, 10)
 }
 
-// Only CSV and Excel are supported. Any legacy/unsupported format (e.g. PDF or
-// combined formats) is gracefully coerced to Excel so existing schedules keep working.
+// Scheduled Reports supports ONLY Excel and PDF (client rule — CSV was removed).
+// Any legacy/unsupported value (e.g. an old "CSV" schedule) is coerced to Excel so
+// existing schedules keep working and never show a format that is no longer offered.
 function normalizeFormat(fmt) {
-  return fmt === 'CSV' || fmt === 'Excel' ? fmt : 'Excel'
+  return fmt === 'PDF' || fmt === 'Excel' ? fmt : 'Excel'
 }
 
 function nextRun(freq) {
@@ -35,49 +37,28 @@ function nextRun(freq) {
   return `${dd}/${mm}/${d.getFullYear()}`
 }
 
-// Legacy/seed formats (PDF, combined) are intentionally left here to verify that
-// normalizeFormat() coerces them safely when the schedules are loaded.
-const INITIAL_SCHEDULES = [
-  {
-    id:1, eq_type:'Inverter',        eq_id:'INVERTER_01',
-    from:'2024-02-08', to:'2024-05-21', interval:'hourly',  agg:'avg',
-    format:'Excel', freq:'Daily',   email:'ops@ge.com',         status:'Active',
-    last_run:'22/06/2026 06:00:00', created:'08/06/2026',
-  },
-  {
-    id:2, eq_type:'PPC',             eq_id:'PPC',
-    from:'2024-02-08', to:'2024-05-21', interval:'daily',   agg:'avg',
-    format:'PDF',   freq:'Weekly',  email:'management@ge.com',  status:'Active',
-    last_run:'18/06/2026 07:00:00', created:'01/06/2026',
-  },
-  {
-    id:3, eq_type:'Daily Generation', eq_id:'INVERTER_DAILY_GEN',
-    from:'2024-02-08', to:'2024-05-21', interval:'monthly', agg:'sum',
-    format:'CSV + Excel + PDF', freq:'Monthly', email:'ceo@ge.com', status:'Active',
-    last_run:'01/06/2026 08:00:00', created:'01/01/2026',
-  },
-  {
-    id:4, eq_type:'Alarms',           eq_id:'Alarms',
-    from:'2024-02-08', to:'2024-05-21', interval:'daily',   agg:'avg',
-    format:'CSV',   freq:'Daily',   email:'ops@ge.com',         status:'Paused',
-    last_run:'21/06/2026 20:00:00', created:'15/06/2026',
-  },
-  {
-    id:5, eq_type:'WMS',              eq_id:'WMS',
-    from:'2024-02-08', to:'2024-05-21', interval:'hourly',  agg:'avg',
-    format:'Excel', freq:'Weekly',  email:'eng@ge.com',         status:'Active',
-    last_run:'16/06/2026 06:30:00', created:'10/06/2026',
-  },
-]
-
 // ── Schedule Form ──────────────────────────────────────────────────────────────
+// Scheduled Reports supports ONLY these three generation reports (client rule).
+// `value` is the backend equipment_type; `label` is what the user sees.
+const SCHEDULED_REPORT_TYPES = [
+  { value: 'Daily Generation',   label: 'Daily Generation Report (DGR)' },
+  { value: 'Monthly Generation', label: 'Monthly Generation Report (MGR)' },
+  { value: 'Yearly Generation',  label: 'Yearly Generation Report (YGR)' },
+]
+const YGR_TYPE = 'Yearly Generation'          // plant-level: has no equipment identifier
+const DEFAULT_TIME = '20:30'                   // default scheduled execution time (8:30 PM)
+
+const typeLabel = (v) =>
+  (SCHEDULED_REPORT_TYPES.find(t => t.value === v)?.label) || v
+
 function ScheduleForm({ initial, onSave, onCancel, recipient }) {
   const [form, setForm] = useState(
     initial
-      ? { ...initial, format: normalizeFormat(initial.format) }
+      ? { ...initial, format: normalizeFormat(initial.format), time: initial.time || DEFAULT_TIME }
       : {
           eq_type:'', eq_id:'', from:todayStr(), to:todayStr(),
           interval:'hourly', agg:DEFAULT_AGG, format:'Excel', freq:'Daily',
+          time: DEFAULT_TIME,
         }
   )
 
@@ -105,13 +86,14 @@ function ScheduleForm({ initial, onSave, onCancel, recipient }) {
       eq_id:    '',
       interval: preset.interval,
       agg:      preset.agg,
-      format:   preset.format,
+      format:   normalizeFormat(preset.format),
     }))
   }
 
   useEffect(() => {
     const type = form.eq_type
-    if (!type) { setEqList([]); return }
+    // YGR is a plant-level report — no equipment identifier to load.
+    if (!type || type === YGR_TYPE) { setEqList([]); return }
     let cancelled = false
     setLoadingEq(true)
     fetchReportEquipmentList(type)
@@ -130,19 +112,11 @@ function ScheduleForm({ initial, onSave, onCancel, recipient }) {
     return () => { cancelled = true }
   }, [form.eq_type])
 
-  // A schedule saved against a report type that is no longer offered stays
-  // selectable so editing it never silently rewrites the type.
-  const typeOptions = useMemo(
-    () => (form.eq_type && !PRESET_TYPES.includes(form.eq_type)
-      ? [...PRESET_TYPES, form.eq_type]
-      : PRESET_TYPES),
-    [form.eq_type])
-
   const preset = getPreset(form.eq_type)
 
   const handleSubmit = e => {
     e.preventDefault()
-    if (!form.eq_type.trim())  return alert('Equipment type required')
+    if (!form.eq_type.trim())  return alert('Report type required')
     onSave(form)
   }
 
@@ -154,12 +128,18 @@ function ScheduleForm({ initial, onSave, onCancel, recipient }) {
           <select className="form-control" value={form.eq_type}
             onChange={e => changeType(e.target.value)}>
             <option value="">— Select —</option>
-            {typeOptions.map(t => <option key={t}>{t}</option>)}
+            {SCHEDULED_REPORT_TYPES.map(t => (
+              <option key={t.value} value={t.value}>{t.label}</option>
+            ))}
           </select>
         </div>
         <div className="flex flex-col gap-1">
           <label className="form-label">Equipment Identifier</label>
-          {loadingEq ? (
+          {form.eq_type === YGR_TYPE ? (
+            <div className="form-control flex items-center text-ge-text3 text-[12px] bg-ge-elevated">
+              Not applicable (plant-level report)
+            </div>
+          ) : loadingEq ? (
             <div className="form-control flex items-center gap-2 text-ge-text3 text-[12px]">
               <Spinner size={12} /> Loading identifiers...
             </div>
@@ -249,6 +229,16 @@ function ScheduleForm({ initial, onSave, onCancel, recipient }) {
         </div>
       </div>
 
+      <div className="grid grid-cols-2 gap-3">
+        <div className="flex flex-col gap-1">
+          <label className="form-label">Schedule Time *</label>
+          <input type="time" className="form-control"
+            value={form.time || DEFAULT_TIME}
+            onChange={e => set('time', e.target.value)} />
+          <span className="text-[10px] text-ge-text3">Report runs daily/weekly/monthly at this time (default 8:30 PM).</span>
+        </div>
+      </div>
+
       {/* Recipient dropdown removed for the testing phase — reports are e-mailed to
           a single recipient configured in the backend (.env). Multi-recipient
           support with a searchable dropdown comes in a later phase. */}
@@ -279,10 +269,9 @@ function ScheduleForm({ initial, onSave, onCancel, recipient }) {
 export default function Scheduled() {
   const { showToast } = useApp()
 
-  // Coerce any legacy/unsupported formats (e.g. PDF) to a supported one on load.
-  const [schedules, setSchedules] = useState(
-    () => INITIAL_SCHEDULES.map(s => ({ ...s, format: normalizeFormat(s.format) }))
-  )
+  // Schedules come entirely from the database (report_schedules) — no dummy data.
+  const [schedules, setSchedules] = useState([])
+  const [loading,   setLoading]   = useState(true)
   const [showForm,  setShowForm]  = useState(false)
   const [editItem,  setEditItem]  = useState(null)
   const [running,   setRunning]   = useState(new Set())
@@ -306,13 +295,31 @@ export default function Scheduled() {
       .catch(() => { /* backend offline — keep defaults */ })
   }, [])
 
-  const MOCK_HISTORY = [
-    { time:'22/06/2026 06:00:00', status:'Success', size:'245 KB', duration:'12s' },
-    { time:'21/06/2026 06:00:00', status:'Success', size:'241 KB', duration:'11s' },
-    { time:'20/06/2026 06:00:00', status:'Failed',  size:'—',      duration:'30s' },
-    { time:'19/06/2026 06:00:00', status:'Success', size:'238 KB', duration:'13s' },
-    { time:'18/06/2026 06:00:00', status:'Success', size:'250 KB', duration:'12s' },
-  ]
+  // Always load schedules from the database. Called on mount and after every
+  // create / edit / delete / run / pause / resume so the list reflects the DB.
+  const loadSchedules = React.useCallback(async () => {
+    try {
+      const data = await fetchSchedules()
+      setSchedules(Array.isArray(data) ? data : [])
+    } catch {
+      setSchedules([])
+    } finally {
+      setLoading(false)
+    }
+  }, [])
+
+  useEffect(() => { loadSchedules() }, [loadSchedules])
+
+  // Real execution history for the open schedule (schedule_runs table).
+  const [history, setHistory] = useState([])
+  useEffect(() => {
+    if (!histItem) { setHistory([]); return }
+    let cancelled = false
+    fetchScheduleRuns(histItem.id)
+      .then(rows => { if (!cancelled) setHistory(Array.isArray(rows) ? rows : []) })
+      .catch(() => { if (!cancelled) setHistory([]) })
+    return () => { cancelled = true }
+  }, [histItem])
 
   const rows = useMemo(() =>
     schedules.filter(s => {
@@ -325,59 +332,61 @@ export default function Scheduled() {
     [schedules, filter, search]
   )
 
-  const handleSave = form => {
-    if (form.id) {
-      setSchedules(prev => prev.map(s => s.id === form.id ? { ...s, ...form } : s))
-      showToast('Schedule updated')
-    } else {
-      const newItem = {
-        ...form,
-        id:       Date.now(),
-        status:   'Active',
-        last_run: '—',
-        created:  new Date().toLocaleDateString('en-GB'),
+  // Create or edit a schedule in the database, then refresh the list so the new /
+  // updated row appears immediately without a page reload.
+  const handleSave = async form => {
+    try {
+      if (form.id) {
+        await updateSchedule(form.id, form)
+        showToast('Schedule updated')
+      } else {
+        await createSchedule(form)
+        showToast('Schedule created')
       }
-      setSchedules(prev => [...prev, newItem])
-      showToast('Schedule created')
+      await loadSchedules()
+      setShowForm(false)
+      setEditItem(null)
+    } catch (e) {
+      showToast(`⚠ Save failed: ${e.message}`)
     }
-    setShowForm(false)
-    setEditItem(null)
   }
 
-  const handleDelete = id => {
-    setSchedules(prev => prev.filter(s => s.id !== id))
-    showToast('Schedule deleted')
+  const handleDelete = async id => {
+    try {
+      await deleteSchedule(id)
+      if (histItem?.id === id) setHistItem(null)
+      await loadSchedules()
+      showToast('Schedule deleted')
+    } catch (e) {
+      showToast(`⚠ Delete failed: ${e.message}`)
+    }
   }
 
-  const handleToggle = id => {
-    setSchedules(prev => prev.map(s =>
-      s.id === id
-        ? { ...s, status: s.status === 'Active' ? 'Paused' : 'Active' }
-        : s
-    ))
-  }
-
-  // Run a schedule now: backend generates the report, attaches it, and e-mails it.
-  const handleRun = async id => {
+  // Pause / Resume against the database, then refresh.
+  const handleToggle = async id => {
     const sch = schedules.find(s => s.id === id)
     if (!sch) return
+    try {
+      if (sch.status === 'Active') await pauseSchedule(id)
+      else                         await resumeSchedule(id)
+      await loadSchedules()
+    } catch (e) {
+      showToast(`⚠ Update failed: ${e.message}`)
+    }
+  }
+
+  // Run a schedule now: backend loads it from the DB, generates the real report,
+  // e-mails it, logs the run, and updates Last Run / Next Run.
+  const handleRun = async id => {
     setRunning(prev => new Set([...prev, id]))
     try {
-      // The schedule's interval/aggregation must reach the backend; on an instant
-      // interval withAggregation() drops `agg_function` so the report stays raw.
-      const res = await sendScheduledEmail(withAggregation({
-        equipment_type: sch.eq_type,
-        equipment_id:   sch.eq_id,
-        format:         sch.format,
-      }, sch.interval, sch.agg))
+      const res = await runSchedule(id)
       if (res?.status === 'Success') {
-        setSchedules(prev => prev.map(s =>
-          s.id === id ? { ...s, last_run: res.execution_time } : s
-        ))
         showToast(`Report e-mailed to ${res.recipient}`)
       } else {
         showToast(`⚠ Email failed: ${res?.error || 'unknown error'}`)
       }
+      await loadSchedules()
     } catch (e) {
       showToast(`⚠ Run failed: ${e.message}`)
     } finally {
@@ -493,7 +502,7 @@ SMTP_FROM_EMAIL=your_gmail_address@gmail.com`}</pre>
         <div className="card mb-4 border-ge-blue/30">
           <div className="card-title">
             {editItem
-              ? `Edit Schedule — ${editItem.eq_type}${editItem.eq_id ? ` / ${editItem.eq_id}` : ''}`
+              ? `Edit Schedule — ${typeLabel(editItem.eq_type)}${editItem.eq_type !== YGR_TYPE && editItem.eq_id ? ` / ${editItem.eq_id}` : ''}`
               : 'Create New Schedule'}
           </div>
           <ScheduleForm
@@ -550,20 +559,22 @@ SMTP_FROM_EMAIL=your_gmail_address@gmail.com`}</pre>
               ) : rows.map(s => (
                 <tr key={s.id}>
                   <td>
-                    <div className="text-[12px] text-ge-text1">{s.eq_type}</div>
+                    <div className="text-[12px] text-ge-text1">{typeLabel(s.eq_type)}</div>
                     <div className="text-[10px] font-mono text-ge-text3">
-                      {s.eq_id} · {s.interval} · {s.agg?.toUpperCase()}
+                      {s.eq_type === YGR_TYPE
+                        ? `Plant-level · ${s.time || DEFAULT_TIME}`
+                        : `${s.eq_id} · ${s.interval} · ${s.agg?.toUpperCase()} · ${s.time || DEFAULT_TIME}`}
                     </div>
                   </td>
                   <td className="whitespace-nowrap w-px">
                     <span className="status-pill pill-blue text-[10px]">{s.format}</span>
                   </td>
                   <td className="font-mono text-[11px] whitespace-nowrap w-px">{s.freq}</td>
-                  <td className="font-mono text-[11px] text-ge-accent whitespace-nowrap w-px">{nextRun(s.freq)}</td>
+                  <td className="font-mono text-[11px] text-ge-accent whitespace-nowrap w-px">{s.next_run || nextRun(s.freq)}</td>
                   <td className="font-mono text-[11px] text-ge-text3 whitespace-nowrap w-px">{s.last_run || '—'}</td>
                   <td className="text-[11px] text-ge-blue max-w-[220px] truncate"
-                    title={recipient}>
-                    {recipient || '—'}
+                    title={s.recipients || recipient}>
+                    {s.recipients || recipient || '—'}
                   </td>
                   <td className="whitespace-nowrap w-px">
                     <div className="flex items-center gap-1.5">
@@ -641,7 +652,13 @@ SMTP_FROM_EMAIL=your_gmail_address@gmail.com`}</pre>
               </tr>
             </thead>
             <tbody>
-              {MOCK_HISTORY.map((h, i) => (
+              {history.length === 0 ? (
+                <tr>
+                  <td colSpan={4} className="text-center text-ge-text3 py-6 text-[12px]">
+                    No executions yet — click ▶ to run this schedule
+                  </td>
+                </tr>
+              ) : history.map((h, i) => (
                 <tr key={i}>
                   <td className="font-mono text-[11px]">{h.time}</td>
                   <td>
