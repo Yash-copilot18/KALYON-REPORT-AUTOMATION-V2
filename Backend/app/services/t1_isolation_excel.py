@@ -38,8 +38,10 @@ overlap. Per-device and total benchmarks (SQL time, Excel time, rows/s) are logg
 import os
 import re
 import time
+import shutil
 import zipfile
 import logging
+import tempfile
 import threading
 from datetime import datetime
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
@@ -521,13 +523,13 @@ def stream_t1_isolation_export(req, equipment_ids, progress: Optional[Callable] 
 # ── Direct-to-Downloads export (NO ZIP) ──────────────────────────────────────
 def _resolve_downloads_dir() -> str:
     """
-    The user's Downloads folder on this (single-machine) deployment. Override with
-    the EXPORT_DOWNLOADS_DIR env var if the reports should land elsewhere. Created
-    if missing.
+    Absolute path to the INTERACTIVE user's Downloads folder — resolved robustly (see
+    app.services.downloads): honours EXPORT_DOWNLOADS_DIR, else the console user's real
+    Downloads (OneDrive-aware, correct even when the backend runs as a service account),
+    never a temp dir or the project folder. Created if missing.
     """
-    d = os.environ.get("EXPORT_DOWNLOADS_DIR") or os.path.join(os.path.expanduser("~"), "Downloads")
-    os.makedirs(d, exist_ok=True)
-    return d
+    from app.services.downloads import resolve_downloads_dir
+    return resolve_downloads_dir()
 
 
 def _unique_path(directory: str, filename: str) -> str:
@@ -639,7 +641,16 @@ def export_to_downloads(req, equipment_ids, progress: Optional[Callable] = None)
     meta = dict(meta)
     meta.setdefault("label", "Tracker")
     n = len(devices)
+    # Files are generated into a TEMP build directory, then packed into ONE ZIP in
+    # Downloads that preserves the folder structure, and the temp dir is removed:
+    #     Downloads\Tracker_Reports_<ts>.zip
+    #         └─ Tracker_Reports_<ts>\Tracker1.xlsx, Tracker2.xlsx, …
+    # The workbooks — contents, sheet names, filenames — are UNCHANGED; only the
+    # packaging (a single ZIP instead of loose files) changed.
+    stamp     = time.strftime("%Y-%m-%d_%H%M%S")
+    arc_root  = f"Tracker_Reports_{stamp}"
     downloads = _resolve_downloads_dir()
+    build_dir = tempfile.mkdtemp(prefix="trk_build_")
 
     def emit(pct, msg):
         if progress:
@@ -648,44 +659,68 @@ def export_to_downloads(req, equipment_ids, progress: Optional[Callable] = None)
             except Exception:
                 pass
 
-    emit(2, f"Processing {n} tracker(s) → Downloads…")
-    logger.info("Tracker per-workbook export start -> trackers=%d | tags=%d | dir=%s | workers=%d",
-                n, len(req_tags), downloads, min(_MAX_WORKERS, n) or 1)
+    emit(2, f"Processing {n} tracker(s)…")
+    logger.info("Tracker ZIP export start -> trackers=%d | tags=%d | build=%s | workers=%d",
+                n, len(req_tags), build_dir, min(_MAX_WORKERS, n) or 1)
 
     t0 = time.time()
     results = []
-    args = (req_tags, meta, from_str, to_str, interval, agg, downloads)
-    if n == 1:
-        results.append(_build_tracker_workbook_dl(devices[0], *args))
-    else:
-        # Independent per-tracker workbooks → true CPU-parallel builds (their SQL reads
-        # overlap too). Each worker has its OWN engine/connection; no shared state.
-        workers = min(_MAX_WORKERS, n)
-        with ProcessPoolExecutor(max_workers=workers) as ex:
-            futs = {ex.submit(_build_tracker_workbook_dl, t, *args): t for t in devices}
-            done = 0
-            for fut in as_completed(futs):
-                res = fut.result()
-                results.append(res)
-                done += 1
-                emit(5 + done * 92 / n, f"{res[0]} done ({done}/{n})…")
+    args = (req_tags, meta, from_str, to_str, interval, agg, build_dir)
+    try:
+        if n == 1:
+            results.append(_build_tracker_workbook_dl(devices[0], *args))
+        else:
+            # Independent per-tracker workbooks → true CPU-parallel builds (their SQL
+            # reads overlap too). Each worker has its OWN engine/connection; no shared state.
+            workers = min(_MAX_WORKERS, n)
+            with ProcessPoolExecutor(max_workers=workers) as ex:
+                futs = {ex.submit(_build_tracker_workbook_dl, t, *args): t for t in devices}
+                done = 0
+                for fut in as_completed(futs):
+                    res = fut.result()
+                    results.append(res)
+                    done += 1
+                    emit(5 + done * 88 / n, f"{res[0]} done ({done}/{n})…")
 
-    saved, total_sheets = [], 0
-    agg_sql = agg_xform = agg_excel = 0.0
-    for disp, fname, nrows, ntags, nsheets, iso, sql_s, xform_s, xl_s in results:
-        saved.append(fname); total_sheets += nsheets
-        agg_sql += sql_s; agg_xform += xform_s; agg_excel += xl_s
-        logger.info("BENCH %s | rows=%d | tags=%d | sheets=%d | sql_fetch=%.2fs | "
-                    "transform=%.2fs | excel=%.2fs", iso, nrows, ntags, nsheets, sql_s, xform_s, xl_s)
+        saved, total_sheets = [], 0
+        agg_sql = agg_xform = agg_excel = 0.0
+        for disp, fname, nrows, ntags, nsheets, iso, sql_s, xform_s, xl_s in results:
+            saved.append(fname); total_sheets += nsheets
+            agg_sql += sql_s; agg_xform += xform_s; agg_excel += xl_s
+            logger.info("BENCH %s | rows=%d | tags=%d | sheets=%d | sql_fetch=%.2fs | "
+                        "transform=%.2fs | excel=%.2fs", iso, nrows, ntags, nsheets, sql_s, xform_s, xl_s)
+        excel_s = max(time.time() - t0, 1e-6)
 
-    wall = max(time.time() - t0, 1e-6)
-    logger.info("BENCH TOTAL | per-tracker workbooks (parallel) | files=%d | sheets=%d | "
-                "SQL_fetch(sum)=%.1fs | transform(sum)=%.1fs | excel(sum)=%.1fs | "
-                "wall=%.1fs | speedup=%.2fx | workers=%d",
-                len(saved), total_sheets, agg_sql, agg_xform, agg_excel, wall,
-                (agg_sql + agg_xform + agg_excel) / wall, min(_MAX_WORKERS, n) or 1)
-    emit(100, f"Saved {len(saved)} tracker report(s) to Downloads.")
-    return {"saved": saved, "directory": downloads, "count": len(saved), "sheets": total_sheets}
+        # ── Pack into ONE ZIP. STORED (no re-compression): each .xlsx is already a
+        # compressed zip, so deflating again burns CPU for ~0% size gain — STORED keeps
+        # ZIP creation fast. Arcname preserves the Tracker_Reports_<ts>\ folder inside.
+        emit(94, f"Packing {len(saved)} file(s) into {arc_root}.zip…")
+        tz = time.time()
+        zip_path = os.path.abspath(os.path.join(downloads, f"{arc_root}.zip"))
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_STORED, allowZip64=True) as zf:
+            for fname in saved:
+                zf.write(os.path.join(build_dir, fname), arcname=f"{arc_root}/{fname}")
+        zip_s = time.time() - tz
+    finally:
+        shutil.rmtree(build_dir, ignore_errors=True)   # always remove the temp dir
+
+    # Verify the archive really exists on disk — a reported success with no file means
+    # a wrong/unwritable location; surface it as an error instead of a false toast.
+    from app.services.downloads import verify_files_written
+    verify_files_written([zip_path])
+
+    total_s = excel_s + zip_s
+    logger.info("BENCH TOTAL | Tracker ZIP | files=%d | sheets=%d | SQL(sum)=%.1fs | "
+                "transform(sum)=%.1fs | excel_gen=%.1fs | zip=%.2fs | total=%.1fs | workers=%d | saved=%s",
+                len(saved), total_sheets, agg_sql, agg_xform, excel_s, zip_s, total_s,
+                min(_MAX_WORKERS, n) or 1, zip_path)
+    logger.info("Tracker export SAVED -> %s", zip_path)
+    emit(100, f"Saved {len(saved)} report(s) to {zip_path}")
+    return {"zip": zip_path, "filename": f"{arc_root}.zip", "path": zip_path,
+            "directory": downloads, "saved": saved,
+            "count": len(saved), "sheets": total_sheets,
+            "excel_seconds": round(excel_s, 2), "zip_seconds": round(zip_s, 2),
+            "total_seconds": round(total_s, 2)}
 
 
 # ── Tracker folder export → D:\Trackers\Tracker{n}\Tags_1_40.xlsx ─────────────

@@ -43,6 +43,47 @@ COMPANY_TITLE = "Kalyon Solar Monitoring — Report Automation"
 _MAX_ROWS      = 10_000     # per-sheet row cap (bounds memory / matches preview export)
 _FETCH_WORKERS = 5          # concurrent equipment fetches
 
+
+# ── Faster .xlsx packaging ───────────────────────────────────────────────────
+# XlsxWriter hard-codes the zip container to zlib's DEFAULT level (6). On the very
+# large raw exports (hundreds of MB of worksheet XML) the final compression at
+# wb.close() is a measurable slice of wall time. Measured on this machine for one
+# full-width tracker sheet (20k rows × 750 cols): close() 7.8s @ L6 → 2.9s @ L2
+# (~2.7× faster), and every UNZIPPED part — worksheet XML, styles, workbook, theme:
+# all data, formatting and layout — stays byte-for-byte identical (verified by
+# SHA-1 of every member). The workbook Excel opens is unchanged; only the container
+# is slightly larger (~15%). Installed ONCE, process-wide (never toggled at runtime,
+# so it is thread-safe) and inherited by ProcessPool export workers on re-import.
+_XLSX_COMPRESSLEVEL = 2
+
+def _install_fast_zip(level: int = _XLSX_COMPRESSLEVEL) -> None:
+    import xlsxwriter.workbook as _wbmod
+    from zipfile import ZipFile as _ZipFile, ZipInfo as _ZipInfo
+    if getattr(_wbmod.ZipFile, "_kalyon_fast", False):
+        return                                   # already installed in this process
+    _Base = _wbmod.ZipFile
+
+    class _FastZipFile(_Base):
+        _kalyon_fast = True
+
+        def __init__(self, *args, **kwargs):
+            # Disk path: XlsxWriter adds members with ZipFile.write(), which honours
+            # the container-level compresslevel.
+            kwargs.setdefault("compresslevel", level)
+            super().__init__(*args, **kwargs)
+
+        def writestr(self, zinfo_or_arcname, data, *args, **kwargs):
+            # in_memory path: members are added with writestr() and an explicit
+            # ZipInfo, which ignores the container compresslevel — so pin it on the
+            # member itself. Never override a level a caller set deliberately.
+            if isinstance(zinfo_or_arcname, _ZipInfo) and zinfo_or_arcname._compresslevel is None:
+                zinfo_or_arcname._compresslevel = level
+            return super().writestr(zinfo_or_arcname, data, *args, **kwargs)
+
+    _wbmod.ZipFile = _FastZipFile
+
+_install_fast_zip()
+
 # ── Palette — clean white/black corporate theme (printer-friendly) ───────────
 BLACK    = "#000000"     # every title, header and data value
 WHITE    = "#FFFFFF"     # sheet / primary row background

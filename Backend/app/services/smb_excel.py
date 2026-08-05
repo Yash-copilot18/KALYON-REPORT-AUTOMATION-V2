@@ -229,9 +229,9 @@ def _fetch_inverter(table, req_tags, from_str, to_str, interval, agg):
             present = [t for t in req_tags if t in col_types]
             missing = [t for t in req_tags if t not in col_types]
             if missing:
-                logger.error(
-                    "SMB export | %s: %d of %d selected tag(s) do NOT exist in the table — "
-                    "they are exported as empty columns, NOT skipped: %s",
+                logger.info(
+                    "SMB export | %s: %d of %d selected tag(s) do NOT exist on this inverter — "
+                    "omitted here (this workbook shows only the SMBs this inverter has): %s",
                     table, len(missing), len(req_tags), missing[:10],
                 )
             cols = present
@@ -252,6 +252,43 @@ def _fetch_inverter(table, req_tags, from_str, to_str, interval, agg):
 
 
 # ── Per-inverter workbook (rendered by the shared report_excel service) ──────
+def _build_inverter_workbook(table, present, missing, rows, req_tags,
+                             from_d, to_d, interval_label, agg_label):
+    """
+    Build ONE inverter's workbook with EXACTLY ONE worksheet, named SMB{inv} to match
+    the inverter (one-to-one): INV1.xlsx → SMB1, INV2.xlsx → SMB2, … INV24.xlsx → SMB24.
+
+    That single sheet holds ALL of this inverter's columns (Timestamp + every SCB
+    column, UI order preserved) — no SCB grouping, no Part/40-column splitting. Returns
+    (bytes, inv, sheets). Shared by the browser export (`_smb_bytes`) and the
+    to-Downloads export, so both produce identical INV{n}.xlsx content.
+    """
+    from app.services import report_excel
+
+    inv = _inv_no(table)
+
+    logger.info("SMB workbook | INV%s → sheet SMB%s | columns=%d | absent_here=%d",
+                inv, inv, len(present), len(missing))
+    if missing:
+        logger.info("    %d selected tag(s) not present on INV%s — omitted: %s",
+                    len(missing), inv, missing[:20])
+
+    # Header block — company title A1, Equipment Type, Equipment ID, From, To,
+    # Interval, Aggregation (unchanged).
+    header = {
+        "equipment_type": "String Combiner",
+        "equipment_id":   f"INV{inv}",
+        "from": from_d, "to": to_d,
+        "interval": interval_label, "agg": agg_label,
+    }
+
+    # ONE-TO-ONE: a single worksheet named SMB{inv} containing every column this
+    # inverter has (Timestamp first, then all present columns in UI order). No grouping.
+    spec = (f"SMB{inv}", dict(header), ["timestamp"] + present, iter(rows), _col_header)
+    wb = report_excel.build_workbook_streaming([spec], wide_print_layout=True)
+    return wb, inv, 1
+
+
 def _smb_bytes(req, equipment_ids, progress=None):
     """
     Build the String Combiner export as ONE workbook per inverter, with ONE worksheet
@@ -304,58 +341,8 @@ def _smb_bytes(req, equipment_ids, progress=None):
 
     # ── One worksheet per SCB (SMB{k}); NO Part splitting ──────────────────────
     def _inverter_workbook(table, present, missing, rows):
-        """
-        Build ONE inverter's workbook — one SMB{k} worksheet per String Combiner,
-        SCBs discovered dynamically and ordered ascending. Returns (bytes, inv, sheets).
-        """
-        inv = _inv_no(table)
-        # Columns come from the UI selection in the UI's / database order — never
-        # re-sorted. Tags absent from the table keep their column and render as "—".
-        tag_cols = req_tags if req_tags else present
-
-        skipped = [t for t in req_tags if t not in set(present)] if req_tags else []
-        logger.info("SMB column audit | INV%s | selected=%d | matched=%d | missing=%d",
-                    inv, len(req_tags), len(present), len(missing))
-        if missing:
-            logger.error("    tags NOT in database (%d), exported as empty columns: %s",
-                         len(missing), missing[:20])
-        if skipped:
-            logger.error("    SKIPPED tags (%d): %s", len(skipped), skipped[:20])
-
-        # Header repeated on EVERY SMB sheet — identical block as before (company title
-        # A1, Equipment Type, Equipment ID, From, To, Interval, Aggregation).
-        header = {
-            "equipment_type": "String Combiner",
-            "equipment_id":   f"INV{inv}",
-            "from": from_d, "to": to_d,
-            "interval": interval_label, "agg": agg_label,
-        }
-
-        # Dynamic SCB discovery: {scb_index: [cols]}, ascending, order within an SCB
-        # preserved. Sheet name SMB{k}. Every sheet shares the SAME already-materialised
-        # `rows` (read once) via a fresh iterator, so no query is repeated.
-        grouped = group_by_scb(tag_cols)
-        grouped_cols = {c for cols in grouped.values() for c in cols}
-        leftover = [c for c in tag_cols if c not in grouped_cols]   # non-SCB cols (rare)
-
-        specs = [
-            (f"SMB{k}", dict(header), ["timestamp"] + cols, iter(rows), _col_header)
-            for k, cols in grouped.items()
-        ]
-        if leftover:
-            # Preserve EXACT data: any column that does not match the SCB pattern is
-            # still exported (kept together on a trailing sheet), never dropped.
-            logger.warning("SMB INV%s | %d column(s) not matched to an SCB, kept on 'Other': %s",
-                           inv, len(leftover), leftover[:10])
-            specs.append(("Other", dict(header), ["timestamp"] + leftover, iter(rows), _col_header))
-        if not specs:
-            specs = [("SMB1", dict(header), ["timestamp"], iter(rows), _col_header)]
-
-        # SINGLE-PASS streaming writer (constant_memory + reused formats) — same
-        # renderer as before, so each SMB sheet's content is identical to that SCB's
-        # columns in the old Part layout; only the sheet grouping changed.
-        wb = report_excel.build_workbook_streaming(iter(specs), wide_print_layout=True)
-        return wb, inv, len(specs)
+        return _build_inverter_workbook(table, present, missing, rows, req_tags,
+                                        from_d, to_d, interval_label, agg_label)
 
     t_render = time.time()
     stamp = datetime.now().strftime("%d-%m-%Y_%H%M%S")
@@ -406,6 +393,98 @@ def build_smb_workbook(db, req, equipment_ids):
 def generate_smb_workbook_streaming(req, equipment_ids, progress=None):
     """Background/async entry point (job + SSE progress). Returns (bytes, filename, content_type)."""
     return _smb_bytes(req, equipment_ids, progress)
+
+
+# ── Direct-to-Downloads export (one parent folder, one INV{n}.xlsx per inverter) ─
+def _downloads_dir() -> str:
+    """Absolute path to the INTERACTIVE user's Downloads folder — resolved robustly
+    (see app.services.downloads): honours EXPORT_DOWNLOADS_DIR, else the console user's
+    real Downloads (OneDrive-aware, correct even when the backend runs as a service
+    account), never a temp dir or the project folder. Created if missing."""
+    from app.services.downloads import resolve_downloads_dir
+    return resolve_downloads_dir()
+
+
+def export_smb_to_downloads(req, equipment_ids, progress=None) -> dict:
+    """
+    Build ONE workbook per inverter and save them all inside a SINGLE timestamped
+    parent FOLDER in Downloads (no ZIP):
+
+        Downloads\\SMB_Reports_<timestamp>\\INV1.xlsx, INV2.xlsx, … INV24.xlsx
+
+    Each INV{n}.xlsx has ONE worksheet per String Combiner — named SMB1, SMB2, …
+    SMB{k} (SCBs discovered dynamically per inverter) — and each SMB sheet holds ALL of
+    that SCB's columns (plus Timestamp). No Part1/Part2 splitting, no 40-column
+    splitting. Filenames, sheet names, headers, filters, formatting and data are
+    UNCHANGED — every file is rendered by the SAME `_build_inverter_workbook` the
+    browser export uses. Each inverter is read ONCE (in parallel) and reused across
+    all of its SMB sheets — the existing performance optimizations are preserved.
+
+    Returns {"directory", "folder_name", "saved":[…], "count", "sheets",
+             "excel_seconds", "total_seconds"}.
+    """
+    tables = [t for t in equipment_ids if _safe_name(t)]
+    interval = req.interval.value if hasattr(req.interval, "value") else str(req.interval)
+    agg      = req.agg_function.value if hasattr(req.agg_function, "value") else str(req.agg_function)
+    from_str = req.from_datetime.strftime("%Y-%m-%d %H:%M:%S")
+    to_str   = req.to_datetime.strftime("%Y-%m-%d %H:%M:%S")
+    from_d   = req.from_datetime.strftime("%d/%m/%Y")
+    to_d     = req.to_datetime.strftime("%d/%m/%Y")
+    interval_label = intervals.interval_label(interval)
+    agg_label      = intervals.agg_label(interval, agg)
+    req_tags = [t for t in (req.tags or []) if _safe_name(t)]
+
+    stamp      = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    folder     = f"SMB_Reports_{stamp}"
+    target_dir = os.path.abspath(os.path.join(_downloads_dir(), folder))
+    os.makedirs(target_dir, exist_ok=True)
+
+    n = len(tables)
+
+    def emit(pct, msg):
+        if progress:
+            try:
+                progress(int(pct), msg)
+            except Exception:
+                pass
+
+    emit(2, f"Processing {n} inverter(s) → Downloads…")
+    logger.info("SMB folder export start -> inverters=%d | tags=%d | dir=%s | workers=%d",
+                n, len(req_tags), target_dir, min(n, _MAX_WORKERS) or 1)
+
+    t0 = time.time()
+    # Parallel fetch — one query per inverter, reused by all of its SMB sheets.
+    workers = min(n, _MAX_WORKERS) or 1
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        fetched = list(ex.map(
+            lambda t: _fetch_inverter(t, req_tags, from_str, to_str, interval, agg), tables))
+
+    saved, written_paths, total_sheets = [], [], 0
+    for i, (table, present, missing, rows) in enumerate(fetched, start=1):   # SELECTED ORDER
+        data, inv, nsheets = _build_inverter_workbook(
+            table, present, missing, rows, req_tags, from_d, to_d, interval_label, agg_label)
+        path = os.path.join(target_dir, f"INV{inv}.xlsx")   # loose in the parent folder
+        with open(path, "wb") as fh:
+            fh.write(data)
+        saved.append(f"INV{inv}.xlsx")
+        written_paths.append(path)
+        total_sheets += nsheets
+        del data
+        emit(5 + i * 93 / n, f"INV{inv} done ({i}/{n})…")
+
+    # Verify every workbook really exists on disk — a reported success with no files
+    # means a wrong/unwritable location; surface it as an error, not a false toast.
+    from app.services.downloads import verify_files_written
+    verify_files_written(written_paths)
+
+    total_s = max(time.time() - t0, 1e-6)
+    logger.info("BENCH TOTAL | SMB folder | files=%d | sheets=%d | excel_gen=%.1fs | saved=%s",
+                len(saved), total_sheets, total_s, target_dir)
+    logger.info("SMB export SAVED -> %s", target_dir)
+    emit(100, f"Saved {len(saved)} report(s) to {target_dir}")
+    return {"directory": target_dir, "path": target_dir, "folder_name": folder, "saved": saved,
+            "count": len(saved), "sheets": total_sheets,
+            "excel_seconds": round(total_s, 2), "total_seconds": round(total_s, 2)}
 
 
 # ── Per-SCB folder export → D:\SMB\INV{n}\SCB{k}.xlsx ────────────────────────────

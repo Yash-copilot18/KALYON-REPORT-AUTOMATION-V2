@@ -24,8 +24,6 @@ import {
   prepareExcelStreamJob,
   exportStreamUrl,
   startExcelToDownloads,
-  startTrackerFolderExport,
-  startSmbFolderExport,
 } from '../../services/api'
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
@@ -439,7 +437,7 @@ function EquipmentMultiSelect({ eqList, selectedIds, setSelectedIds, disabled, l
               {selectedIds.has(eq.equipment_id) && '✓'}
             </div>
             <span className="text-[12px] text-ge-text1 flex-1 leading-tight truncate">
-              {eq.display_name}
+              {trackerDisplayName(eq.display_name)}
             </span>
           </div>
         ))}
@@ -485,29 +483,22 @@ function EquipmentMultiSelect({ eqList, selectedIds, setSelectedIds, disabled, l
   )
 }
 
-// ── Tag Selector (range selection removed — now on Equipment) ──────────────────
-function DynamicTagSelector({ tags, selected, setSelected }) {
-  const [query,  setQuery]  = useState('')
-  const [sorted, setSorted] = useState(false)
-
+// ── Tag Selector (READ-ONLY) ──────────────────────────────────────────────────
+// Same layout/styling as before, but the panel is view-only: every available tag
+// is auto-selected upstream and shown in both lists; search, sort, Clear All and
+// every tag checkbox are disabled, so the user can inspect the selection but never
+// change it. `selected` is driven entirely by the parent's auto-select effect.
+function DynamicTagSelector({ tags, selected }) {
   const tagIndex = useMemo(() => {
     const map = {}
     tags.forEach((t, i) => { map[t.column_name] = i + 1 })
     return map
   }, [tags])
 
-  const displayed = useMemo(() => {
-    let list = sorted ? [...tags].sort((a, b) => a.tag.localeCompare(b.tag)) : tags
-    return list.filter(t => t.tag.toLowerCase().includes(query.toLowerCase()))
-  }, [tags, query, sorted])
+  // Read-only → no filtering/sorting is possible, so every tag is always shown.
+  const displayed = tags
 
-  // Only fully-available tags are selectable; partial ones are shown but locked.
-  const isAvail   = t => t.available !== false
-  const toggle    = col => setSelected(prev => {
-    const s = new Set(prev); s.has(col) ? s.delete(col) : s.add(col); return s
-  })
-  const clearAll  = () => setSelected(new Set())
-
+  const isAvail = t => t.available !== false
   const availableCount = useMemo(() => tags.filter(isAvail).length, [tags])
   const partialCount   = tags.length - availableCount
 
@@ -520,21 +511,21 @@ function DynamicTagSelector({ tags, selected, setSelected }) {
         <span className="text-[10px] font-mono text-ge-accent">{selected.size} selected</span>
       </div>
 
-      {/* Search + Sort */}
+      {/* Search + Sort — rendered exactly as before, but disabled (read-only). */}
       <div className="flex items-center gap-2 mb-2">
         <div className="relative flex-1">
           <span className="absolute left-2.5 top-1/2 -translate-y-1/2 text-ge-text3 text-sm">🔍</span>
-          <input type="text" value={query} onChange={e => setQuery(e.target.value)}
+          <input type="text" value="" readOnly disabled
             placeholder="Search tags..." className="form-control pl-7 text-[12px]" />
         </div>
-        <button className="btn btn-outline btn-sm" onClick={() => setSorted(s => !s)}>
-          {sorted ? 'Default' : 'A→Z'}
+        <button className="btn btn-outline btn-sm" disabled>
+          A→Z
         </button>
       </div>
 
-      {/* Quick actions — no bulk "Select All"; tags are chosen individually. */}
+      {/* Quick actions — Clear All disabled (selection cannot be modified). */}
       <div className="flex items-center gap-2 mb-2.5 flex-wrap">
-        <button className="btn btn-outline btn-sm" onClick={clearAll}>✕ Clear All</button>
+        <button className="btn btn-outline btn-sm" disabled>✕ Clear All</button>
         <span className="ml-auto text-[11px] text-ge-text3 font-mono">
           Showing: {displayed.length}
         </span>
@@ -548,7 +539,7 @@ function DynamicTagSelector({ tags, selected, setSelected }) {
         </div>
       )}
 
-      {/* Tag lists */}
+      {/* Tag lists — display only; no click/keyboard interaction. */}
       <div className="grid grid-cols-2 gap-2.5">
         {/* Available */}
         <div>
@@ -565,11 +556,10 @@ function DynamicTagSelector({ tags, selected, setSelected }) {
                 const isSel = selected.has(tag.column_name)
                 return (
                 <div key={tag.column_name}
-                  onClick={() => avail && toggle(tag.column_name)}
                   title={avail ? '' : `Available in ${tag.available_in} of ${tag.total} selected equipment`}
-                  className={`flex items-center gap-2 px-2 py-1.5
-                             border-b border-ge-border last:border-b-0 transition-colors
-                             ${avail ? 'cursor-pointer hover:bg-ge-surface' : 'cursor-not-allowed opacity-50'}
+                  className={`flex items-center gap-2 px-2 py-1.5 cursor-default select-none
+                             border-b border-ge-border last:border-b-0
+                             ${avail ? '' : 'opacity-50'}
                              ${isSel ? 'bg-ge-blue/10' : ''}`}>
                   <span className="text-[9px] font-mono text-ge-text3 w-5 text-right flex-shrink-0">
                     {tagIndex[tag.column_name]}
@@ -609,10 +599,9 @@ function DynamicTagSelector({ tags, selected, setSelected }) {
               : [...selected].map(col => {
                   const tag = tags.find(t => t.column_name === col) || { tag: col, unit: '' }
                   return (
-                    <div key={col} onClick={() => toggle(col)}
-                      className="flex items-center gap-2 px-2.5 py-1.5 cursor-pointer
-                                 border-b border-ge-border last:border-b-0 transition-colors
-                                 hover:bg-ge-surface bg-ge-blue/10">
+                    <div key={col}
+                      className="flex items-center gap-2 px-2.5 py-1.5 cursor-default select-none
+                                 border-b border-ge-border last:border-b-0 bg-ge-blue/10">
                       <div className="w-3.5 h-3.5 rounded flex items-center justify-center
                                       text-[9px] flex-shrink-0 bg-ge-blue border border-ge-blue text-white">
                         ✓
@@ -657,6 +646,7 @@ export default function Reports() {
   const [loadingExport, setLoadingExport] = useState(false)
   const [exportLabel,   setExportLabel]   = useState('')
   const [exportJob,     setExportJob]     = useState(null)  // { pct, message, status }
+  const [savedLocation, setSavedLocation] = useState(null)  // absolute path of last saved export
   const [loadJob,       setLoadJob]       = useState(null)  // { pct, message, status }
   const esRef     = useRef(null)
   const loadEsRef = useRef(null)
@@ -1126,7 +1116,7 @@ export default function Reports() {
   // finishes — no ZIP, no browser download. We only start the job and show live
   // progress ("Saved ISO13_Report.xlsx …") over the existing SSE stream.
   const runToDownloadsExport = async () => {
-    setLoadingExport(true); setExportLabel('Excel')
+    setLoadingExport(true); setExportLabel('Excel'); setSavedLocation(null)
     setExportJob({ pct: 0, message: 'Preparing export…', status: 'running' })
     try {
       const payload = buildPayload(1, 10000)
@@ -1141,6 +1131,11 @@ export default function Reports() {
         if (d.status === 'done') {
           es.close(); esRef.current = null
           setExportJob(null); setLoadingExport(false); setExportLabel('')
+          // The backend message ends with the absolute save path — surface it and
+          // keep it visible so the user knows exactly where the files landed.
+          const savedPath = (d.json_result && (d.json_result.path || d.json_result.directory))
+            || (d.message || '').replace(/^Saved .*? to /, '') || null
+          setSavedLocation(savedPath)
           showToast(d.message || 'Reports saved to Downloads')
         } else if (d.status === 'error') {
           es.close(); esRef.current = null
@@ -1159,49 +1154,6 @@ export default function Reports() {
     }
   }
 
-  // Folder export (NEW action, additive): the backend writes an organised folder tree
-  // to the server's disk — one Excel file per unit — and reports progress over the same
-  // SSE stream. String Combiner → D:\SMB\INV{n}\SCB{k}.xlsx; Tracker (T1/T2 Isolation)
-  // → D:\Trackers\Tracker{n}\Tags_{a}_{b}.xlsx. Nothing downloads in the browser.
-  const folderExportKind = () => {
-    if (eqType === 'String Combiner') return { start: startSmbFolderExport, label: 'SMB folders' }
-    if (isTrackerType(eqType))
-      return { start: startTrackerFolderExport, label: 'Tracker folders' }
-    return null
-  }
-
-  const runFolderExport = async () => {
-    const kind = folderExportKind()
-    if (!kind) return
-    setLoadingExport(true); setExportLabel('Folders')
-    setExportJob({ pct: 0, message: 'Preparing export…', status: 'running' })
-    try {
-      const payload = buildPayload(1, 10000)
-      const { job_id } = await kind.start(payload)
-      const es = new EventSource(exportProgressUrl(job_id))
-      esRef.current = es
-      es.onmessage = (evt) => {
-        let d; try { d = JSON.parse(evt.data) } catch { return }
-        setExportJob({ pct: d.progress ?? 0, message: d.message || '', status: d.status })
-        if (d.status === 'done' || d.status === 'error') {
-          es.close(); esRef.current = null
-          setExportJob(null); setLoadingExport(false); setExportLabel('')
-          showToast(d.status === 'done'
-            ? (d.message || 'Reports saved to disk folders')
-            : `Export failed: ${d.message || 'unknown error'}`)
-        }
-      }
-      es.onerror = () => {
-        es.close(); esRef.current = null
-        setExportJob(null); setLoadingExport(false); setExportLabel('')
-      }
-    } catch (e) {
-      console.error('[Export] folder export failed to start:', e)
-      showToast(`Export failed: ${e.message}`)
-      setExportJob(null); setLoadingExport(false); setExportLabel('')
-    }
-  }
-
   // Clean up any open SSE connections on unmount.
   useEffect(() => () => {
     if (esRef.current) esRef.current.close()
@@ -1211,14 +1163,15 @@ export default function Reports() {
   const handleExportCSV   = () => handleDownload(exportReportCSVV2,   'csv',  10000, 'CSV')
   const handleExportExcel = () => {
     // Export routing (no data preload required — all stream from the backend):
-    //  · T1/T2 Isolation (any count)→ direct-to-Downloads: each device report is
-    //                                 built in parallel and saved to the Downloads
-    //                                 folder as it finishes (NO ZIP, no browser dl)
-    //  · String Combiner (any count)→ async job (one worksheet per SMB)
+    //  · Tracker (T1/T2 Isolation) → direct-to-Downloads: each device report is built
+    //                                in parallel and saved into a single timestamped
+    //                                folder (Downloads\Tracker_Reports_<ts>\Tracker{n}.xlsx)
+    //  · String Combiner           → direct-to-Downloads: one INV{n}.xlsx per inverter,
+    //                                all inside Downloads\SMB_Reports_<ts>\ (NO ZIP)
     //  · any multi-equipment select → async job (one worksheet per equipment)
     // Single-equipment (1 sheet) stays synchronous.
     if (isTrackerType(eqType) && selectedEqIds.size > 0) return runToDownloadsExport()
-    if (eqType === 'String Combiner')                        return runAsyncExport()
+    if (eqType === 'String Combiner' && selectedEqIds.size > 0) return runToDownloadsExport()
     if (selectedEqIds.size > 1)                              return runAsyncExport()
     return handleDownload(exportReportExcelV2, 'xlsx', 10000, 'Excel')
   }
@@ -1389,7 +1342,7 @@ export default function Reports() {
                   <span key={id}
                     className="inline-flex items-center gap-1 px-2 py-0.5 rounded
                                bg-ge-blue/20 border border-ge-blue/40 text-ge-blue text-[11px] font-mono">
-                    {id}
+                    {trackerDisplayName(id)}
                     <button
                       onClick={() => setSelectedEqIds(prev => {
                         const s = new Set(prev); s.delete(id); return s
@@ -1412,14 +1365,16 @@ export default function Reports() {
         )}
       </div>
 
-      {/* Tag Selection */}
+      {/* Tag Selection — READ-ONLY. Every available tag is auto-selected and shown
+          in both lists exactly as before; all interactions are disabled so the user
+          can view but not modify the selection. */}
       <div className="card mb-3">
         {loadingTags ? (
           <div className="flex items-center gap-2 py-6 text-ge-text3 text-[12px]">
             <Spinner size={14} /> Loading tags from database...
           </div>
         ) : tagList.length > 0 ? (
-          <DynamicTagSelector tags={tagList} selected={selected} setSelected={setSelected} />
+          <DynamicTagSelector tags={tagList} selected={selected} />
         ) : eqType ? (
           <div className="text-[12px] text-ge-text3 py-4 text-center">
             {selectedEqIds.size > 0 ? 'No tags found' : 'Select Equipment Identifier to load tags'}
@@ -1488,14 +1443,11 @@ export default function Reports() {
 
           <ExportBtn onClick={handleExportCSV}   icon="📊" label="CSV"   />
           <ExportBtn onClick={handleExportExcel} icon="📗" label="Excel" />
-          {folderExportKind() && (
-            <ExportBtn onClick={runFolderExport} icon="🗂" label="Folders" />
-          )}
 
           {result && (
             <div className="ml-auto flex items-center gap-3">
               <span className="text-[11px] font-mono text-ge-text3">
-                {result.table_name} · {INTERVAL_LABELS[result.interval] || result.interval}
+                {trackerDisplayName(result.table_name)} · {INTERVAL_LABELS[result.interval] || result.interval}
               </span>
             </div>
           )}
@@ -1514,6 +1466,22 @@ export default function Reports() {
               <div className="h-full bg-ge-accent transition-all duration-300"
                 style={{ width: `${exportJob.pct}%` }} />
             </div>
+          </div>
+        )}
+
+        {/* Persistent saved-location line — shows the REAL absolute path on disk. */}
+        {!exportJob && savedLocation && (
+          <div className="mt-3 pt-3 border-t border-ge-border flex items-start gap-2">
+            <span className="text-ge-accent text-[13px] leading-none mt-0.5">✓</span>
+            <div className="flex-1 min-w-0">
+              <div className="text-[11px] text-ge-text2">Saved to:</div>
+              <div className="text-[12px] font-mono text-ge-text1 break-all">{savedLocation}</div>
+            </div>
+            <button
+              onClick={() => setSavedLocation(null)}
+              className="text-[11px] text-ge-text3 hover:text-ge-danger leading-none"
+              title="Dismiss"
+            >×</button>
           </div>
         )}
       </div>

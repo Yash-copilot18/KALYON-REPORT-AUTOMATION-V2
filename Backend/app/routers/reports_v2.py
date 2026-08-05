@@ -607,8 +607,8 @@ def export_download(job_id: str):
 def export_excel_to_downloads(req: ReportDataRequest):
     from app.services import export_jobs
 
-    if req.equipment_type not in ("T1 Isolation", "T2 Isolation", "Tracker"):
-        raise HTTPException(400, detail="Direct-to-Downloads export is only for T1/T2 Isolation")
+    if req.equipment_type not in ("T1 Isolation", "T2 Isolation", "Tracker", "String Combiner"):
+        raise HTTPException(400, detail="Direct-to-Downloads export is only for Tracker / String Combiner")
 
     ids = req.equipment_ids or [req.equipment_id]
     job_id = export_jobs.create_job()
@@ -618,15 +618,25 @@ def export_excel_to_downloads(req: ReportDataRequest):
 
     def run():
         try:
-            from app.services.t1_isolation_excel import export_to_downloads
-
             def prog(pct, msg):
                 export_jobs.update(job_id, status="running", progress=pct, message=msg)
 
-            result = export_to_downloads(req, ids, prog)
+            # Each export writes its files into a single timestamped parent folder in
+            # Downloads (Tracker_Reports_<ts>\Tracker{n}.xlsx / SMB_Reports_<ts>\INV{n}.xlsx).
+            if req.equipment_type == "String Combiner":
+                from app.services.smb_excel import export_smb_to_downloads
+                result = export_smb_to_downloads(req, ids, prog)
+            else:
+                from app.services.t1_isolation_excel import export_to_downloads
+                result = export_to_downloads(req, ids, prog)
+            # Absolute path on disk (the ZIP for Tracker, the folder for SMB).
+            saved_path = result.get("path") or result.get("directory") or "Downloads"
             count = result.get("count", 0)
+            logger.info("To-Downloads done | job=%s | saved=%s | files=%d | excel=%.1fs | zip=%.2fs | total=%.1fs",
+                        job_id, saved_path, count, result.get("excel_seconds", 0),
+                        result.get("zip_seconds", 0), result.get("total_seconds", 0))
             export_jobs.update(job_id, status="done", progress=100,
-                               message=f"Saved {count} tracker report(s) to Downloads.",
+                               message=f"Saved {count} report(s) to {saved_path}",
                                json_result=result)
         except Exception as e:  # noqa: BLE001 — surface failure to the client
             logger.error("To-Downloads export job %s failed: %s", job_id, e, exc_info=True)

@@ -94,7 +94,6 @@ export default function Dashboard() {
     <div>
       <PageHeader
         title="Operations Dashboard"
-        subtitle="Real-time plant monitoring"
       />
 
       {/* KPIs — single responsive grid, all values live from backend */}

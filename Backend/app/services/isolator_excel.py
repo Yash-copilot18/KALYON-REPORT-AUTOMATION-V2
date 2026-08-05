@@ -31,6 +31,7 @@ from sqlalchemy import text
 
 from app.database.session import SessionLocal
 from app.services import schema_cache, isolator_columns as ic, intervals
+from app.services import report_excel as _report_excel  # noqa: F401 — installs faster .xlsx zip packaging
 from app.repositories.reports_repository import _build_interval_expr
 
 logger = logging.getLogger(__name__)
