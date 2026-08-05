@@ -303,7 +303,11 @@ EQUIPMENT_REGISTRY = {
     },
 
     # ── Tracker MBOX Status ───────────────────────────────────────────────────
-    "Tracker": {
+    # Renamed from "Tracker": the operator-facing "Tracker" type is now the merged
+    # T1/T2 isolation devices (see the "Tracker" entry below). This MBOX status report
+    # is retired from the dropdown (kept here so nothing that referenced its columns
+    # breaks). It is queried by its own table, never via this key.
+    "Tracker MBOX Status": {
         "tables":   ["TRACKER_MBOX_STATUS"],
         "time_col": "TimeCol",
         "tags": {
@@ -357,7 +361,28 @@ EQUIPMENT_REGISTRY = {
         "time_col": "TimeCol",
         "tags": {}  # Will be auto-discovered from DB
     },
+
+    # ── Tracker (operator-facing merge of T1 + T2 Isolation) ──────────────────
+    # The single equipment type shown in the Reports dropdown for the isolation
+    # devices. It spans the SAME physical ISO tables (T1_IS1…T1_IS12, T2_IS13…
+    # T2_IS24) — the database tables and every SQL query are unchanged. The devices
+    # are DISPLAYED as Tracker1…Tracker24 (see get_equipment_list), but their
+    # equipment_id remains the real table name, so tag/preview/export/scheduled flows
+    # route to the existing T1/T2 isolation services with no business-logic changes.
+    # "T1 Isolation"/"T2 Isolation" are retained above purely for internal routing and
+    # are hidden from the dropdown (see HIDDEN_EQUIPMENT_TYPES).
+    "Tracker": {
+        "tables": [f"T1_IS{i}" for i in range(1, 13)] + [f"T2_IS{i}" for i in range(13, 25)],
+        "time_col": "TimeCol",
+        "tags": {}  # auto-discovered (isolation columns), identical to T1/T2
+    },
 }
+
+
+# Report types kept in the registry for INTERNAL routing/data access but never offered
+# as a selectable type in the Reports Equipment-Type dropdown. The isolation sections
+# are surfaced only through the merged "Tracker" type; the MBOX status report is retired.
+HIDDEN_EQUIPMENT_TYPES = frozenset({"T1 Isolation", "T2 Isolation", "Tracker MBOX Status"})
 
 
 # ── Validation helpers ────────────────────────────────────────────────────────
@@ -414,6 +439,7 @@ class ReportsRepository:
                 "equipment_count": len(config["tables"]),
             }
             for eq_type, config in EQUIPMENT_REGISTRY.items()
+            if eq_type not in HIDDEN_EQUIPMENT_TYPES
         ]
 
     @staticmethod
@@ -423,12 +449,14 @@ class ReportsRepository:
             raise HTTPException(400, detail=f"Unknown type: {equipment_type}")
 
         def _display(table: str) -> str:
-            # Isolation devices are shown as ISO<n> (underlying tables are
-            # T1_IS1…T1_IS12 and T2_IS13…T2_IS24). Only these types are remapped.
-            if equipment_type in ("T1 Isolation", "T2 Isolation"):
-                m = re.match(r"T\d+_IS0*(\d+)", table, re.IGNORECASE)
-                if m:
-                    return f"ISO{m.group(1)}"
+            # The merged "Tracker" type shows its devices as Tracker<n>; the legacy
+            # T1/T2 Isolation types (internal only) still show ISO<n>. Underlying tables
+            # are T1_IS1…T1_IS12 / T2_IS13…T2_IS24 in every case (never renamed).
+            m = re.match(r"T\d+_IS0*(\d+)", table, re.IGNORECASE)
+            if equipment_type == "Tracker" and m:
+                return f"Tracker{m.group(1)}"
+            if equipment_type in ("T1 Isolation", "T2 Isolation") and m:
+                return f"ISO{m.group(1)}"
             return table.replace("_", " ")
 
         return [

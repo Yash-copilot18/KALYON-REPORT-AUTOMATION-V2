@@ -9,6 +9,7 @@ from app.models.reports import (
     AlarmsData,
     TemperatureReport,
 )
+from app.models.schedules import ReportSchedule, ScheduleRun
 
 __all__ = [
     "Equipment",
@@ -20,4 +21,6 @@ __all__ = [
     "WMSData",
     "AlarmsData",
     "TemperatureReport",
+    "ReportSchedule",
+    "ScheduleRun",
 ]

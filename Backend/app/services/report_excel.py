@@ -126,7 +126,17 @@ def safe_sheet_name(name: str, used: set) -> str:
 
 
 def _meta_fields(header: dict):
-    """Ordered (label, value) metadata pairs shared by both sheet renderers."""
+    """
+    Ordered (label, value) metadata pairs shared by both sheet renderers.
+
+    A caller may override the exact rows by putting a `meta_fields` list of
+    (label, value) tuples on the header (e.g. to drop the Aggregation row for a
+    specific report); when absent, the default six-row block is used, so every
+    existing caller is unaffected.
+    """
+    custom = header.get("meta_fields")
+    if custom is not None:
+        return list(custom)
     return [
         ("Equipment Type", header.get("equipment_type", "")),
         ("Equipment ID",   header.get("equipment_id", "")),
@@ -138,10 +148,37 @@ def _meta_fields(header: dict):
 
 
 # ── The one professional sheet renderer ──────────────────────────────────────
+def _apply_wide_print_layout(ws, hdr_row: int, last_row: int, last_col: int,
+                             sheet_name: str) -> None:
+    """
+    Print setup for a WIDE single-table sheet (e.g. the 336-column SMB export).
+
+    No scale-to-fit is attempted: a few hundred columns cannot be squeezed onto one
+    page at a legible size. Instead the sheet is made navigable across the pages it
+    genuinely needs — the header row repeats down the pages and the timestamp column
+    repeats across them, so no page is ever a block of numbers with no time
+    reference. Opt-in only; narrow reports keep their existing print behaviour.
+    """
+    ws.set_landscape()
+    ws.set_paper(_PAPER_A4)
+    ws.set_margins(left=_MARGIN_LR, right=_MARGIN_LR, top=_MARGIN_TB, bottom=_MARGIN_TB)
+    ws.print_area(0, 0, max(last_row, hdr_row), last_col)
+    ws.repeat_rows(hdr_row, hdr_row)     # column headers on every page down
+    ws.repeat_columns(0, 0)              # timestamp column on every page across
+    ws.set_footer(f"&L&\"Calibri,Regular\"&8{sheet_name}"
+                  f"&R&\"Calibri,Regular\"&8Page &P of &N")
+
+
 def write_report_sheet(wb, fmt, sheet_name: str, header: dict,
                        columns: List[str], rows: List[dict],
-                       label_fn: Callable[[str], str]) -> None:
-    """Render one worksheet. Empty rows → 'No Data Available' (never skipped)."""
+                       label_fn: Callable[[str], str],
+                       wide_print_layout: bool = False) -> None:
+    """
+    Render one worksheet. Empty rows → 'No Data Available' (never skipped).
+
+    `wide_print_layout` opts into print settings tuned for very wide tables; it
+    defaults off so every existing caller renders exactly as before.
+    """
     ws = wb.add_worksheet(sheet_name)
     n = max(len(columns), 1)
     last_col = n - 1
@@ -185,6 +222,8 @@ def write_report_sheet(wb, fmt, sheet_name: str, header: dict,
 
     if not rows:
         ws.write(HDR + 1, 0, "No Data Available", fmt["nodata"])
+        if wide_print_layout:
+            _apply_wide_print_layout(ws, HDR, HDR + 1, last_col, sheet_name)
         return
 
     r = HDR + 1
@@ -209,13 +248,155 @@ def write_report_sheet(wb, fmt, sheet_name: str, header: dict,
              fmt["foot"])
     ws.autofilter(HDR, 0, r - 1, last_col)
 
+    if wide_print_layout:
+        _apply_wide_print_layout(ws, HDR, r, last_col, sheet_name)
+
+
+# ── Streaming sheet renderer (rows consumed lazily from a generator) ─────────
+def write_report_sheet_streaming(wb, fmt, sheet_name: str, header: dict,
+                                 columns: List[str], rows_iter,
+                                 label_fn: Callable[[str], str],
+                                 wide_print_layout: bool = False) -> int:
+    """
+    Byte-for-byte the SAME sheet as `write_report_sheet`, but `rows_iter` is an
+    ITERATOR yielded lazily (e.g. a batched DB reader) instead of a materialised
+    list — so a sheet of any size uses constant memory. Crucially it is also a
+    SINGLE pass: `write_report_sheet` measures every cell once for auto-fit widths
+    and then again to write it (two passes); this formats each cell once, growing
+    the width as it writes — halving the per-cell Python work for the same output.
+
+    Column auto-fit still matches exactly: widths are seeded from the header labels
+    and grown per cell as rows stream by (O(columns) memory), then applied with
+    `set_column` at the end. XlsxWriter serialises column info at close(), so a
+    deferred set_column in constant_memory mode is honoured (verified).
+
+    `wide_print_layout` mirrors the same option on `write_report_sheet` so callers
+    that use it (e.g. the String Combiner export) get identical print setup.
+
+    Returns the number of data rows written (for logging / progress).
+    """
+    ws = wb.add_worksheet(sheet_name)
+    n = max(len(columns), 1)
+    last_col = n - 1
+
+    # Width seed = the header label (same as the batch renderer's starting point).
+    widths = [max((len(x) for x in label_fn(col).split()), default=8) + 2 for col in columns]
+
+    # Report header block — identical rows/heights to write_report_sheet.
+    ws.write(0, 0, COMPANY_TITLE, fmt["title"]); ws.set_row(0, 24)
+    ws.write(1, 0, header.get("subtitle", ""), fmt["subtitle"]); ws.set_row(1, 18)
+    for i, (k, v) in enumerate(_meta_fields(header)):
+        r = 3 + i
+        ws.write(r, 0, k, fmt["meta_lbl"])
+        ws.write(r, 1, str(v), fmt["meta"])
+        ws.set_row(r, 14)
+
+    HDR = 10
+    for ci, col in enumerate(columns):
+        ws.write(HDR, ci, label_fn(col), fmt["hdr"])
+    ws.set_row(HDR, 30)
+    ws.freeze_panes(HDR + 1, 0)
+
+    # Hot-path locals: on a large export this loop runs millions of times, so binding
+    # the two write methods and the (even, odd) format pairs to locals removes a
+    # method-attribute lookup and a dict lookup from EVERY cell. Output is unchanged —
+    # only the number of Python name lookups drops.
+    _write, _write_number = ws.write, ws.write_number
+    _ts  = (fmt["ts_even"],  fmt["ts_odd"])
+    _na  = (fmt["na_even"],  fmt["na_odd"])
+    _int = (fmt["int_even"], fmt["int_odd"])
+    _num = (fmt["num_even"], fmt["num_odd"])
+    _txt = (fmt["txt_even"], fmt["txt_odd"])
+
+    r = HDR + 1
+    count = 0
+    for row in rows_iter:
+        p = count & 1                 # even row → 0, odd row → 1 (indexes the fmt pair)
+        f_ts, f_na, f_int, f_num, f_txt = _ts[p], _na[p], _int[p], _num[p], _txt[p]
+        get = row.get
+        for ci, col in enumerate(columns):
+            v = get(col)
+            # `s` is the width-measuring string — computed identically to the batch
+            # renderer's auto-fit pass so column widths come out the same.
+            if col == "timestamp":
+                tv = fmt_ts(v) if v else ""     # format once, reuse for width + cell
+                s = tv
+                _write(r, ci, tv if v else "—", f_ts)
+            elif v is None:
+                s = ""
+                _write(r, ci, "—", f_na)
+            elif isinstance(v, bool):
+                s = str(v)
+                _write(r, ci, int(v), f_int)
+            elif isinstance(v, (int, float)):
+                s = f"{v:.3f}" if isinstance(v, float) else str(v)
+                _write_number(r, ci, float(v), f_num)
+            else:
+                s = str(v)
+                _write(r, ci, str(v), f_txt)
+            if len(s) > widths[ci]:
+                widths[ci] = len(s)
+        r += 1
+        count += 1
+
+    if count == 0:
+        ws.write(HDR + 1, 0, "No Data Available", fmt["nodata"])
+        if wide_print_layout:
+            _apply_wide_print_layout(ws, HDR, HDR + 1, last_col, sheet_name)
+    else:
+        ws.write(r, 0,
+                 f"{count:,} records  ·  Generated {time.strftime('%d/%m/%Y %H:%M:%S')}",
+                 fmt["foot"])
+        ws.autofilter(HDR, 0, r - 1, last_col)
+        if wide_print_layout:
+            _apply_wide_print_layout(ws, HDR, r, last_col, sheet_name)
+
+    for ci, w in enumerate(widths):
+        ws.set_column(ci, ci, min(max(w + 1, 12), 40))
+    return count
+
+
+def build_workbook_streaming(specs: Iterable, progress: Optional[Callable[[int, str], None]] = None,
+                             total: int = 0, prog_lo: int = 0, prog_hi: int = 100,
+                             wide_print_layout: bool = False) -> bytes:
+    """
+    Like `build_workbook`, but each spec's rows are an ITERATOR consumed lazily, so
+    only one batch of rows is ever in memory across the whole workbook, and each
+    sheet is written in a SINGLE pass (no separate auto-fit scan). Each spec is
+    (sheet_name, header, columns, rows_iter, label_fn). `wide_print_layout` is
+    forwarded to every sheet. Returns bytes.
+    """
+    buf = io.BytesIO()
+    wb = xlsxwriter.Workbook(buf, {"constant_memory": True, "in_memory": True})
+    fmt = make_formats(wb)
+    used: set = set()
+    i = 0
+    for name, header, columns, rows_iter, label_fn in specs:
+        write_report_sheet_streaming(wb, fmt, safe_sheet_name(name, used), header,
+                                     columns, rows_iter, label_fn,
+                                     wide_print_layout=wide_print_layout)
+        i += 1
+        if progress and total:
+            pct = prog_lo + int(i / total * (prog_hi - prog_lo))
+            progress(min(pct, prog_hi), f"Writing {name}… ({i}/{total})")
+    if i == 0:
+        write_report_sheet_streaming(wb, fmt, "Report", {"subtitle": "No data"},
+                                     ["timestamp"], iter([]), lambda c: "Timestamp")
+    wb.close()
+    return buf.getvalue()
+
 
 # ── Sectioned sheet renderer (many tables stacked on ONE worksheet) ──────────
 # Excel's hard limit. A sectioned sheet stacks N tables, so the row budget is
 # shared — we cap rows per section rather than let XlsxWriter overflow.
 EXCEL_MAX_ROWS = 1_048_576
 _BLANK_ROWS_BETWEEN = 3        # readability gap between sections
-_SECTION_OVERHEAD = 2 + _BLANK_ROWS_BETWEEN   # title row + header row + gap
+_SECTION_OVERHEAD = 1 + _BLANK_ROWS_BETWEEN   # header row + gap (no title band)
+
+# Report header block occupies rows 0-9; the first section starts at row 10.
+# These rows are ALSO the print titles repeated at the top of every printed page.
+_HDR_BLOCK_LAST_ROW = 9
+_SECTION_START_ROW  = 10
 
 
 def _section_row_cap(sections: List[Tuple[str, List[str], List[dict]]]) -> int:
@@ -225,6 +406,64 @@ def _section_row_cap(sections: List[Tuple[str, List[str], List[dict]]]) -> int:
     return max(budget // n, 1)
 
 
+# ── Print layout — one section (SMB) per printed page ────────────────────────
+# A4 landscape. Every section starts on a fresh page, and the report title +
+# equipment metadata reprint at the top of each page via Excel's print titles.
+_PAPER_A4        = 9
+_MARGIN_LR       = 0.3        # inches
+_MARGIN_TB       = 0.4        # inches
+_A4_LANDSCAPE_W  = 11.69      # inches
+_A4_LANDSCAPE_H  = 8.27       # inches
+_PT_PER_INCH     = 72.0
+_DEFAULT_ROW_PT  = 15.0       # XlsxWriter default row height
+
+
+def _table_width_inches(widths: List[int]) -> float:
+    """
+    Printed width of the table in inches.
+
+    Excel column widths are in "characters"; the pixel conversion below is the
+    standard Calibri-11 metric XlsxWriter itself documents (7px per character
+    plus 5px of cell padding), and 96px == 1 inch.
+    """
+    px = 0.0
+    for w in widths:
+        px += (w * 7 + 5) if w >= 1 else (w * 12 + 0.5)
+    return px / 96.0
+
+
+def _fit_scale(widths: List[int]) -> int:
+    """
+    Print scale (%) that pulls the table onto ONE page wide.
+
+    `fit_to_pages()` is deliberately NOT used here. XlsxWriter documents that the
+    fit-to-page option overrides ALL manual page breaks, which would silently undo
+    the one-section-per-page layout. `set_print_scale()` is Excel's "Adjust to N%"
+    option, which is honoured alongside manual page breaks.
+    """
+    table_in = _table_width_inches(widths)
+    printable = _A4_LANDSCAPE_W - (2 * _MARGIN_LR)
+    if table_in <= printable:
+        return 100
+    return max(int(printable / table_in * 100), 10)   # Excel's floor is 10%
+
+
+def _rows_per_page(scale: int) -> int:
+    """
+    Approx. data rows that fit below the repeated header on one A4 landscape page.
+
+    Used only to warn when a section will overflow its page — a section longer
+    than this still starts on a fresh page, but will continue onto further pages,
+    so the SMB-number == page-number mapping no longer holds one-to-one.
+    """
+    printable_pt = (_A4_LANDSCAPE_H - 2 * _MARGIN_TB) * _PT_PER_INCH
+    printable_pt -= 43                      # default header/footer allowance
+    printable_pt -= 24 + 15 + 15 + (6 * 14) + 15   # repeated title/meta block
+    printable_pt -= 32                      # column header row (no section band)
+    row_pt = _DEFAULT_ROW_PT * (scale / 100.0)
+    return max(int(printable_pt / row_pt), 1) if row_pt > 0 else 1
+
+
 def write_sectioned_sheet(wb, fmt, sheet_name: str, header: dict,
                           sections: List[Tuple[str, List[str], List[dict]]],
                           label_fn: Callable[[str], str]) -> None:
@@ -232,9 +471,19 @@ def write_sectioned_sheet(wb, fmt, sheet_name: str, header: dict,
     Render ONE worksheet holding several titled tables stacked vertically.
 
     Used by the String Combiner export: one sheet per inverter, carrying SMB1…SMB21
-    as bold-titled sections separated by blank rows. Rows are written strictly top
-    to bottom, so this stays compatible with XlsxWriter's constant_memory mode —
-    memory stays flat no matter how many sections a sheet holds.
+    as sections separated by blank rows. Each section starts directly with its own
+    column-header row — there is no "SMB1"/"SMB2" title band. Rows are written
+    strictly top to bottom, so this stays compatible with XlsxWriter's
+    constant_memory mode — memory stays flat no matter how many sections a sheet
+    holds.
+
+    The only title line is COMPANY_TITLE in A1; the per-sheet subtitle is not
+    rendered.
+
+    PRINT LAYOUT: every section begins on a new printed page (SMB1 → page 1,
+    SMB2 → page 2, …) via a manual page break before each section after the first.
+    The report title and equipment metadata are set as Excel print titles, so they
+    reprint at the top of every page without being duplicated in the sheet data.
     """
     ws = wb.add_worksheet(sheet_name)
 
@@ -261,9 +510,12 @@ def write_sectioned_sheet(wb, fmt, sheet_name: str, header: dict,
     for ci, w in enumerate(widths):
         ws.set_column(ci, ci, w)
 
-    # Report header block — identical to the single-table sheet (no merged cells).
+    # Report header block — no merged cells. The company title is the ONLY title
+    # line: the per-sheet subtitle ("String Combiner — INV1 — 21 SMB sections") is
+    # deliberately not written. Row 1 is left empty rather than shifting the block
+    # up, so the metadata rows, the print-titles range and the section start row all
+    # keep their positions.
     ws.write(0, 0, COMPANY_TITLE, fmt["title"]); ws.set_row(0, 24)
-    ws.write(1, 0, header.get("subtitle", ""), fmt["subtitle"]); ws.set_row(1, 18)
 
     for i, (k, v) in enumerate(_meta_fields(header)):
         r = 3 + i
@@ -271,19 +523,26 @@ def write_sectioned_sheet(wb, fmt, sheet_name: str, header: dict,
         ws.write(r, 1, str(v), fmt["meta"])
         ws.set_row(r, 14)
 
+    # Print scale is derived from the final column widths, so it must be computed
+    # after auto-fit but before the sections are written (rows_per_page warns on
+    # sections that will spill past their own page).
+    scale = _fit_scale(widths)
+    rows_per_page = _rows_per_page(scale)
+
     cap = _section_row_cap(sections)
     truncated = False
-    r = 10
+    r = _SECTION_START_ROW
     first_hdr_row = None
+    section_starts: List[int] = []      # first row of each section → page breaks
+    overflow: List[str] = []            # sections too tall for a single page
 
     for title, cols, rows in sections:
-        # Bold section title (e.g. "SMB1") — the gray band is painted cell-by-cell
-        # rather than merged, so no merged cells are introduced.
-        ws.write(r, 0, title, fmt["section"])
-        for ci in range(1, n):
-            ws.write_blank(r, ci, None, fmt["section"])
-        ws.set_row(r, 20)
-        r += 1
+        # A section begins directly with its COLUMN HEADERS. The bold "SMB1" band
+        # that used to sit above them is intentionally not written — each block is
+        # identified by its own column names (SCB1 …, SCB2 …) and by starting on a
+        # fresh printed page. `title` is still carried for logging and page-break
+        # diagnostics.
+        section_starts.append(r)
 
         # Column headers for this section.
         for ci, col in enumerate(cols):
@@ -323,6 +582,8 @@ def write_sectioned_sheet(wb, fmt, sheet_name: str, header: dict,
         # Per-section footer, then the readability gap before the next section.
         ws.write(r, 0, f"{len(body):,} records", fmt["foot"])
         r += 1 + _BLANK_ROWS_BETWEEN
+        if len(body) > rows_per_page:
+            overflow.append(f"{title} ({len(body)} rows)")
 
         # Excel permits exactly ONE autofilter per worksheet — apply it to the first
         # section's table so the columns stay filterable.
@@ -331,6 +592,35 @@ def write_sectioned_sheet(wb, fmt, sheet_name: str, header: dict,
 
     if first_hdr_row is not None:
         ws.freeze_panes(first_hdr_row + 1, 0)
+
+    # ── Print layout: one section per printed page ───────────────────────────
+    # A4 landscape with narrow margins; the table is scaled (never fit_to_pages,
+    # which would discard the manual breaks) so all columns land on one page wide.
+    ws.set_landscape()
+    ws.set_paper(_PAPER_A4)
+    ws.set_margins(left=_MARGIN_LR, right=_MARGIN_LR, top=_MARGIN_TB, bottom=_MARGIN_TB)
+    ws.set_print_scale(scale)
+    ws.center_horizontally()
+    ws.print_area(0, 0, max(r - 1, _SECTION_START_ROW), last_col)
+
+    # Report title + equipment metadata reprint at the top of every page. Excel
+    # prints these once on page 1 (they are the sheet's own first rows) and repeats
+    # them on every page thereafter — no duplicated block in the data itself.
+    ws.repeat_rows(0, _HDR_BLOCK_LAST_ROW)
+
+    # A break BEFORE every section except the first: SMB1 → page 1, SMB2 → page 2 …
+    if len(section_starts) > 1:
+        ws.set_h_pagebreaks(section_starts[1:])
+
+    ws.set_footer(f"&L&\"Calibri,Regular\"&8{sheet_name}"
+                  f"&R&\"Calibri,Regular\"&8Page &P of &N")
+
+    if overflow:
+        logger.warning(
+            "Sheet %s: %d section(s) hold more than ~%d rows and will continue onto "
+            "additional pages, so section number no longer equals page number: %s",
+            sheet_name, len(overflow), rows_per_page, ", ".join(overflow[:5]),
+        )
 
     if truncated:
         logger.error(
@@ -368,15 +658,22 @@ def build_sectioned_workbook(specs: Iterable[SectionedSheetSpec],
 
 
 def build_workbook(specs: Iterable[SheetSpec], progress: Optional[Callable[[int, str], None]] = None,
-                   total: int = 0, prog_lo: int = 0, prog_hi: int = 100) -> bytes:
-    """Write every sheet-spec into one constant-memory workbook. Returns bytes."""
+                   total: int = 0, prog_lo: int = 0, prog_hi: int = 100,
+                   wide_print_layout: bool = False) -> bytes:
+    """
+    Write every sheet-spec into one constant-memory workbook. Returns bytes.
+
+    `wide_print_layout` is forwarded to every sheet; it defaults off so the existing
+    callers (equipment export, T1 isolation, single-sheet preview) are unaffected.
+    """
     buf = io.BytesIO()
     wb = xlsxwriter.Workbook(buf, {"constant_memory": True, "in_memory": True})
     fmt = make_formats(wb)
     used: set = set()
     i = 0
     for name, header, columns, rows, label_fn in specs:
-        write_report_sheet(wb, fmt, safe_sheet_name(name, used), header, columns, rows, label_fn)
+        write_report_sheet(wb, fmt, safe_sheet_name(name, used), header, columns, rows, label_fn,
+                           wide_print_layout=wide_print_layout)
         i += 1
         if progress and total:
             pct = prog_lo + int(i / total * (prog_hi - prog_lo))

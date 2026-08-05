@@ -14,7 +14,7 @@
 //
 // Excel is the only export format offered on this page by design.
 
-import React, { useState, useEffect, useMemo, useCallback } from 'react'
+import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react'
 import { PageHeader, FormRow, FormGroup, Spinner, Skeleton } from '../../components/Common'
 import { useApp } from '../../utils/AppContext'
 import {
@@ -22,6 +22,10 @@ import {
   showsAggregation,
 } from '../../utils/intervals'
 import { getPreset } from '../../utils/reportPresets'
+import {
+  listTemplates, createAutoTemplate, updateTemplate,
+  renameTemplate, deleteTemplate, TEMPLATE_VERSION,
+} from '../../utils/reportTemplates'
 import {
   fetchReportEquipmentList,
   fetchReportTags,
@@ -64,6 +68,29 @@ function saveBlob(blob, filename) {
 // on two different tables never collides.
 const selKey = s => `${s.type}|${s.eqId}|${s.column}`
 
+// Build the multi-report request body from a plain config object (either the live
+// page state or a saved template's config). Kept pure so "Open" can preview a
+// template straight from its stored config, before the async tag loads finish.
+function payloadFromConfig(c, pageNum, size) {
+  const byEquipment = new Map()
+  ;(c.selected || []).forEach(s => {
+    const k = `${s.type}|${s.eqId}`
+    if (!byEquipment.has(k)) {
+      byEquipment.set(k, { equipment_type: s.type, equipment_id: s.eqId, tags: [] })
+    }
+    byEquipment.get(k).tags.push(s.column)
+  })
+  return {
+    sources:       [...byEquipment.values()],
+    from_datetime: toISO(c.fromDate),
+    to_datetime:   toISO(c.toDate),
+    interval:      c.interval,
+    agg_function:  c.agg,
+    page:          pageNum,
+    page_size:     size,
+  }
+}
+
 // ── Main page ────────────────────────────────────────────────────────────────
 export default function Preconfigured() {
   const { showToast } = useApp()
@@ -92,6 +119,21 @@ export default function Preconfigured() {
   const [page,       setPage]       = useState(1)
   const [pageSize,   setPageSize]   = useState(PAGE_SIZES[0])
 
+  // ── Templates (front-end only; localStorage, never touches the backend) ────
+  const [templates,  setTemplates]  = useState(() => listTemplates())
+  const [tplId,      setTplId]      = useState('')   // template selected in the dropdown
+  const refreshTemplates = useCallback(() => setTemplates(listTemplates()), [])
+
+  // A template that has been Opened: its config is loaded on the page. While it is
+  // opened-but-not-editing the configuration controls are locked (read-only) — the
+  // user clicks Edit to unlock them. `openedTplId` is the Save-Changes target.
+  const [openedTplId, setOpenedTplId] = useState('')
+  const [locked,      setLocked]      = useState(false)
+
+  // Set true immediately before a template load so the "seed interval/agg from the
+  // first type" effect below does NOT overwrite the values the template restored.
+  const restoringRef = useRef(false)
+
   const patch = useCallback((type, changes) => {
     setSrcs(prev => ({ ...prev, [type]: { ...(prev[type] || {}), ...changes } }))
   }, [])
@@ -107,6 +149,7 @@ export default function Preconfigured() {
 
   // ── Add / remove an equipment type ────────────────────────────────────────
   const toggleType = useCallback((type) => {
+    if (locked) return                       // opened template is read-only until Edit
     setTypes(prev => {
       if (prev.includes(type)) {
         // Removing a type also drops the columns that belonged to it.
@@ -130,20 +173,25 @@ export default function Preconfigured() {
       return [...prev, type]
     })
     setResult(null)
-  }, [patch, loadTags])
+  }, [locked, patch, loadTags])
 
   // Switching a type's equipment invalidates that type's picks (they belong to
   // the previous device); every other type's selection is preserved.
   const changeEquipment = useCallback((type, eqId) => {
+    if (locked) return
     patch(type, { eqId })
     setSelected(sel => sel.filter(s => s.type !== type))
     setResult(null)
     loadTags(type, eqId)
-  }, [patch, loadTags])
+  }, [locked, patch, loadTags])
 
   // Seed interval/aggregation from the first type added (same presets the Reports
   // and Scheduled screens use). Both remain editable.
+  //
+  // Skipped exactly once right after a template load: the template already carries
+  // its own interval/agg and must not be clobbered by the preset for its first type.
   useEffect(() => {
+    if (restoringRef.current) { restoringRef.current = false; return }
     if (types.length !== 1) return
     const preset = getPreset(types[0])
     setInterval(preset.interval)
@@ -152,12 +200,13 @@ export default function Preconfigured() {
 
   // ── Column selection ──────────────────────────────────────────────────────
   const toggleColumn = useCallback((type, eqId, tag) => {
+    if (locked) return
     const entry = { type, eqId, column: tag.column_name, label: tag.tag, unit: tag.unit }
     setSelected(prev => prev.some(s => selKey(s) === selKey(entry))
       ? prev.filter(s => selKey(s) !== selKey(entry))
       : [...prev, entry])          // appended → selection order is the column order
     setResult(null)
-  }, [])
+  }, [locked])
 
   const selectedKeys = useMemo(() => new Set(selected.map(selKey)), [selected])
 
@@ -184,25 +233,10 @@ export default function Preconfigured() {
 
   // ── Request payload ───────────────────────────────────────────────────────
   // Selections collapse into one source per equipment, tags in pick order.
-  const buildPayload = useCallback((pageNum, size) => {
-    const byEquipment = new Map()
-    selected.forEach(s => {
-      const k = `${s.type}|${s.eqId}`
-      if (!byEquipment.has(k)) {
-        byEquipment.set(k, { equipment_type: s.type, equipment_id: s.eqId, tags: [] })
-      }
-      byEquipment.get(k).tags.push(s.column)
-    })
-    return {
-      sources:       [...byEquipment.values()],
-      from_datetime: toISO(fromDate),
-      to_datetime:   toISO(toDate),
-      interval,
-      agg_function:  agg,
-      page:          pageNum,
-      page_size:     size,
-    }
-  }, [selected, fromDate, toDate, interval, agg])
+  const buildPayload = useCallback((pageNum, size) =>
+    payloadFromConfig(
+      { selected, fromDate, toDate, interval, agg }, pageNum, size),
+  [selected, fromDate, toDate, interval, agg])
 
   const ready = selected.length > 0
 
@@ -211,17 +245,14 @@ export default function Preconfigured() {
     try {
       const data = await fetchMultiReportData(buildPayload(pageNum, size))
       setResult(data); setPage(pageNum); setPageSize(size)
+      return true
     } catch (e) {
       setError(e.message || 'Failed to generate report'); setResult(null)
+      return false
     } finally {
       setGenerating(false)
     }
   }, [buildPayload])
-
-  const handleGenerate = () => {
-    if (!ready) return showToast('Select at least one column')
-    runReport(1, pageSize)
-  }
 
   const handleExportExcel = async () => {
     if (!ready) return showToast('Select at least one column')
@@ -238,6 +269,153 @@ export default function Preconfigured() {
       setExporting(false)
     }
   }
+
+  // ── Template snapshot / restore ───────────────────────────────────────────
+  // Capture the WHOLE current configuration. `selected` is self-contained (each
+  // entry carries type/eqId/column/label/unit), so restoring columns needs no
+  // network round-trip; only the per-type equipment lists are re-fetched on load.
+  const snapshotConfig = useCallback(() => ({
+    version:      TEMPLATE_VERSION,
+    types,
+    eqIds:        Object.fromEntries(types.map(t => [t, (srcs[t] || {}).eqId || ''])),
+    selected,
+    fromDate, toDate, interval, agg,
+    exportFormat: 'Excel',        // this page exports Excel only, by design
+  }), [types, srcs, selected, fromDate, toDate, interval, agg])
+
+  // Populate every existing control from a saved template. Existing components and
+  // their behaviour are untouched — this only sets the same state the user would.
+  const applyTemplate = useCallback((tpl) => {
+    const c = tpl?.config || {}
+    restoringRef.current = true
+    setError(null); setResult(null)
+
+    const tps = Array.isArray(c.types) ? c.types : []
+    setTypes(tps)
+    setActiveType(tps[0] || '')
+    setSelected(Array.isArray(c.selected) ? c.selected : [])
+    if (c.fromDate) setFromDate(c.fromDate)
+    if (c.toDate)   setToDate(c.toDate)
+    if (c.interval) setInterval(c.interval)
+    if (c.agg)      setAgg(c.agg)
+
+    // Rebuild each type's source: fetch its equipment list + the saved device's
+    // columns so the Available panel repopulates exactly as if picked by hand.
+    setSrcs({})
+    tps.forEach(type => {
+      const savedEqId = (c.eqIds || {})[type] || ''
+      patch(type, { loadingEq: true, eqList: [], eqId: savedEqId, tags: [] })
+      fetchReportEquipmentList(type)
+        .then(d => {
+          const list = Array.isArray(d) ? d : (d?.items || d?.data || [])
+          const eqId = list.some(e => e.equipment_id === savedEqId)
+            ? savedEqId : (list[0]?.equipment_id || '')
+          patch(type, { eqList: list, eqId, loadingEq: false })
+          loadTags(type, eqId)
+        })
+        .catch(() => patch(type, { eqList: [], eqId: savedEqId, loadingEq: false }))
+    })
+  }, [patch, loadTags])
+
+  // ── Generate Report — also records the configuration as a template ────────
+  // The template history is a by-product of generating, so the user never has to
+  // create one by hand. Recording happens only after a SUCCESSFUL generate, and
+  // only from this explicit action — pagination / rows-per-page call runReport
+  // directly and never add to the history.
+  const autoTemplateName = useCallback(() => {
+    const d = new Date()
+    const p = n => String(n).padStart(2, '0')
+    const stamp = `${p(d.getDate())}/${p(d.getMonth() + 1)}/${d.getFullYear()} ` +
+                  `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`
+    const label = types.length ? types.join(' + ') : 'Report'
+    return `${label} · ${stamp}`
+  }, [types])
+
+  const handleGenerate = useCallback(async () => {
+    if (!ready) return showToast('Select at least one column')
+    const ok = await runReport(1, pageSize)
+    if (!ok) return
+    // A fresh generate is a NEW configuration — it is never the opened template, so
+    // clear any open/lock state so the page is fully editable again.
+    setOpenedTplId(''); setLocked(false)
+    const res = createAutoTemplate(autoTemplateName(), snapshotConfig())
+    if (res.ok) {
+      refreshTemplates()
+      setTplId(res.template.id)
+    }
+    // A failure here (storage full/disabled) must never block the generated report,
+    // which is already on screen — so it is intentionally silent.
+  }, [ready, pageSize, runReport, autoTemplateName, snapshotConfig, refreshTemplates, showToast])
+
+  // ── Template actions (Open · Edit · Save Changes · Rename · Delete) ────────
+
+  // Open: load the template's whole configuration into the page AND show its report
+  // preview immediately. Controls are LOCKED (read-only) until the user clicks Edit.
+  const handleTplOpen = useCallback(async () => {
+    if (!tplId) return showToast('Select a template to open')
+    const tpl = templates.find(t => t.id === tplId)
+    if (!tpl) return showToast('Template not found')
+
+    applyTemplate(tpl)                 // populate every control from the config
+    setOpenedTplId(tpl.id)
+    setLocked(true)                    // opened, not yet editing
+
+    // Preview straight from the stored config so the user immediately sees the same
+    // report that was generated before (no wait for the async tag loads).
+    setGenerating(true); setError(null)
+    try {
+      const data = await fetchMultiReportData(payloadFromConfig(tpl.config, 1, pageSize))
+      setResult(data); setPage(1)
+    } catch (e) {
+      setError(e.message || 'Failed to load report preview'); setResult(null)
+    } finally {
+      setGenerating(false)
+    }
+    showToast(`Opened "${tpl.name}"`)
+  }, [tplId, templates, applyTemplate, pageSize, showToast])
+
+  // Edit: unlock the controls of the currently opened template for modification.
+  const handleTplEdit = useCallback(() => {
+    if (!openedTplId) return showToast('Open a template first, then Edit')
+    setLocked(false)
+    const tpl = templates.find(t => t.id === openedTplId)
+    showToast(`Editing "${tpl?.name || 'template'}" — change anything, then Save Changes`)
+  }, [openedTplId, templates, showToast])
+
+  // Save Changes: write the current configuration back to the opened template.
+  const handleTplUpdate = useCallback(() => {
+    const targetId = openedTplId || tplId
+    if (!targetId) return showToast('Open a template first')
+    const res = updateTemplate(targetId, snapshotConfig())
+    if (!res.ok) return showToast(res.error)
+    refreshTemplates()
+    setLocked(true)                    // saved → back to read-only view
+    showToast(`Saved changes to "${res.template.name}"`)
+  }, [openedTplId, tplId, snapshotConfig, refreshTemplates, showToast])
+
+  // Rename: prompt for a new name (no separate name field on the page).
+  const handleTplRename = useCallback(() => {
+    if (!tplId) return showToast('Select a template to rename')
+    const tpl = templates.find(t => t.id === tplId)
+    const next = window.prompt('Rename template', tpl?.name || '')
+    if (next === null) return          // user cancelled
+    const res = renameTemplate(tplId, next)
+    if (!res.ok) return showToast(res.error)
+    refreshTemplates()
+    showToast(`Renamed to "${res.template.name}"`)
+  }, [tplId, templates, refreshTemplates, showToast])
+
+  const handleTplDelete = useCallback(() => {
+    if (!tplId) return showToast('Select a template to delete')
+    const tpl = templates.find(t => t.id === tplId)
+    if (tpl && !window.confirm(`Delete template "${tpl.name}"? This cannot be undone.`)) return
+    const res = deleteTemplate(tplId)
+    if (!res.ok) return showToast(res.error)
+    refreshTemplates()
+    if (openedTplId === tplId) { setOpenedTplId(''); setLocked(false) }
+    setTplId('')
+    showToast('Template deleted')
+  }, [tplId, openedTplId, templates, refreshTemplates, showToast])
 
   // ── Preview table ─────────────────────────────────────────────────────────
   const tableCols = useMemo(() => {
@@ -261,6 +439,60 @@ export default function Preconfigured() {
     <div>
       <PageHeader title="Preconfigured Reports" />
 
+      {/* Templates — a history of generated report configurations. Every Generate
+          Report below adds the configuration here automatically; the user never
+          creates one by hand. Pure front-end (localStorage); does not affect report
+          generation or Excel export. */}
+      <div className="card mb-3">
+        <div className="card-title">Templates</div>
+        <div className="flex flex-wrap items-end gap-x-4 gap-y-3">
+          <FormGroup label="Generated Templates">
+            <select className="form-control" style={{ minWidth: 260 }}
+              value={tplId}
+              onChange={e => setTplId(e.target.value)}>
+              <option value="">— Select a generated report —</option>
+              {templates.map(t => (
+                <option key={t.id} value={t.id}>{t.name}</option>
+              ))}
+            </select>
+          </FormGroup>
+
+          <div className="flex flex-wrap items-center gap-3 pb-0.5">
+            <button type="button" className="btn btn-success btn-sm"
+              onClick={handleTplOpen} disabled={!tplId}
+              title="Load this configuration and preview into the page below">
+              📂 Open
+            </button>
+            <button type="button" className="btn btn-primary btn-sm"
+              onClick={handleTplEdit} disabled={!openedTplId || !locked}
+              title="Enable editing of the opened template">
+              ✏ Edit
+            </button>
+            <button type="button" className="btn btn-outline btn-sm"
+              onClick={handleTplUpdate} disabled={!openedTplId || locked}
+              title="Save your modifications back to the opened template">
+              ✔ Save Changes
+            </button>
+            <button type="button" className="btn btn-outline btn-sm"
+              onClick={handleTplRename} disabled={!tplId}
+              title="Rename the selected template">
+              🏷 Rename
+            </button>
+            <button type="button" className="btn btn-outline btn-sm"
+              onClick={handleTplDelete} disabled={!tplId}
+              title="Delete the selected template">
+              🗑 Delete
+            </button>
+          </div>
+
+          <span className="ml-auto self-end pb-2 text-[11px] font-mono text-ge-text3">
+            {openedTplId
+              ? (locked ? '🔒 Opened (read-only) — click Edit to modify' : '✏ Editing — Save Changes when done')
+              : `${templates.length} generated report${templates.length === 1 ? '' : 's'}`}
+          </span>
+        </div>
+      </div>
+
       {/* Equipment types — several may be active at once */}
       <div className="card mb-3">
         <div className="card-title">Equipment Types</div>
@@ -269,7 +501,7 @@ export default function Preconfigured() {
             const on = types.includes(t)
             const n  = selected.filter(s => s.type === t).length
             return (
-              <button key={t} onClick={() => toggleType(t)}
+              <button key={t} onClick={() => toggleType(t)} disabled={locked}
                 className={`btn btn-sm ${on ? 'btn-primary' : 'btn-outline'}`}>
                 {on ? '✓ ' : '+ '}{t}{n > 0 ? ` (${n})` : ''}
               </button>
@@ -297,7 +529,7 @@ export default function Preconfigured() {
                   ) : (
                     <select className="form-control" value={s.eqId || ''}
                       onChange={e => changeEquipment(t, e.target.value)}
-                      disabled={!(s.eqList || []).length}>
+                      disabled={locked || !(s.eqList || []).length}>
                       {(s.eqList || []).map(e => (
                         <option key={e.equipment_id} value={e.equipment_id}>
                           {e.display_name || e.equipment_id}
@@ -317,22 +549,23 @@ export default function Preconfigured() {
         <div className="card-title">Report Configuration</div>
         <FormRow>
           <FormGroup label="From Date">
-            <input type="datetime-local" className="form-control"
+            <input type="datetime-local" className="form-control" disabled={locked}
               value={fromDate} onChange={e => setFromDate(e.target.value)} />
           </FormGroup>
           <FormGroup label="To Date">
-            <input type="datetime-local" className="form-control"
+            <input type="datetime-local" className="form-control" disabled={locked}
               value={toDate} onChange={e => setToDate(e.target.value)} />
           </FormGroup>
           <FormGroup label="Time Interval">
-            <select className="form-control" value={interval}
+            <select className="form-control" value={interval} disabled={locked}
               onChange={e => { setInterval(e.target.value); setAgg(DEFAULT_AGG) }}>
               {INTERVALS.map(v => <option key={v} value={v}>{INTERVAL_LABELS[v]}</option>)}
             </select>
           </FormGroup>
           {showsAggregation(interval) && (
             <FormGroup label="Aggregation">
-              <select className="form-control" value={agg} onChange={e => setAgg(e.target.value)}>
+              <select className="form-control" value={agg} disabled={locked}
+                onChange={e => setAgg(e.target.value)}>
                 {AGG_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
               </select>
             </FormGroup>
@@ -369,7 +602,7 @@ export default function Preconfigured() {
                     {shownTags.length} / {activeTags.length}
                   </span>
                   <button type="button" className="btn btn-outline btn-sm"
-                    disabled={!activeTags.length}
+                    disabled={locked || !activeTags.length}
                     title={`Select every ${activeType} column`}
                     onClick={() => setSelected(prev => {
                       const have = new Set(prev.map(selKey))
@@ -382,7 +615,7 @@ export default function Preconfigured() {
                     ✓ Select All
                   </button>
                   <button type="button" className="btn btn-outline btn-sm"
-                    disabled={!selected.some(s => s.type === activeType)}
+                    disabled={locked || !selected.some(s => s.type === activeType)}
                     title={`Clear the selected ${activeType} columns`}
                     onClick={() => setSelected(prev => prev.filter(s => s.type !== activeType))}>
                     ✕ Clear
@@ -397,7 +630,8 @@ export default function Preconfigured() {
                   className="form-control pl-7 text-[12px]" />
               </div>
 
-              <div className="bg-ge-elevated border border-ge-border rounded-md overflow-y-auto max-h-72">
+              <div className={`bg-ge-elevated border border-ge-border rounded-md overflow-y-auto max-h-72
+                              ${locked ? 'opacity-60 pointer-events-none' : ''}`}>
                 {active.loadingTags ? (
                   <div className="flex items-center gap-2 px-3 py-6 text-[12px] text-ge-text3">
                     <Spinner size={13} /> Loading columns from database...
@@ -465,9 +699,9 @@ export default function Preconfigured() {
                           {s.label || s.column}
                         </span>
                         {s.unit && <span className="text-[10px] font-mono text-ge-text3">{s.unit}</span>}
-                        <button type="button" title="Remove"
+                        <button type="button" title="Remove" disabled={locked}
                           onClick={() => setSelected(prev => prev.filter(x => selKey(x) !== selKey(s)))}
-                          className="px-1 text-[11px] text-ge-text3 hover:text-ge-danger">✕</button>
+                          className="px-1 text-[11px] text-ge-text3 hover:text-ge-danger disabled:opacity-40">✕</button>
                       </div>
                     ))}
                   </div>

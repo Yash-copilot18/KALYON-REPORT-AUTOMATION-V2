@@ -6,6 +6,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 from typing import Optional, List
 import io
+import re
 import json
 import time
 import asyncio
@@ -107,6 +108,19 @@ def col_header(col: str) -> str:
     return f"{label} ({unit})" if unit else label
 
 
+def display_equipment_id(equipment_type: str, equipment_id) -> str:
+    """
+    PRESENTATION-only equipment name for user-facing text (CSV metadata, filenames).
+    The merged "Tracker" type shows Tracker{n}; every other type is unchanged. The real
+    equipment_id (the table name) is never modified — this only affects what is shown.
+    """
+    if equipment_type == "Tracker":
+        m = re.match(r"^T\d+_IS0*(\d+)$", str(equipment_id or ""), re.IGNORECASE)
+        if m:
+            return f"Tracker{m.group(1)}"
+    return equipment_id
+
+
 def today_dmy() -> str:
     return datetime.now().strftime("%d-%m-%Y")
 
@@ -135,7 +149,7 @@ def _csv_metadata(req: ReportDataRequest):
     return [
         ("Project Name",          PROJECT_NAME),
         ("Report Name",           f"{req.equipment_type} Report"),
-        ("Equipment",             req.equipment_id or ""),
+        ("Equipment",             display_equipment_id(req.equipment_type, req.equipment_id) or ""),
         ("Generated Date & Time", now_dmy()),
         ("From Date",             fmt_ts(req.from_datetime)),
         ("To Date",               fmt_ts(req.to_datetime)),
@@ -439,7 +453,7 @@ def export_csv(req: ReportDataRequest, db: Session = Depends(get_db)):
         header_fn=col_header,          # user-friendly, unit-labelled headers
     )
     gen_ms   = (time.perf_counter() - tg) * 1000
-    filename = f"{req.equipment_id}_Report_{today_dmy()}.csv"
+    filename = f"{display_equipment_id(req.equipment_type, req.equipment_id)}_Report_{today_dmy()}.csv"
     _log_export("CSV", meta, query_ms, gen_ms, (time.perf_counter() - t0) * 1000)
 
     return StreamingResponse(
@@ -463,16 +477,18 @@ def export_excel(req: ReportDataRequest, db: Session = Depends(get_db)):
     ids = req.equipment_ids or [req.equipment_id]
     logger.info("Excel export request | type=%s | equipment=%d | tags_received=%d",
                 req.equipment_type, len(ids), len(req.tags or []))
+    xlsx_ctype = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     if req.equipment_type == "String Combiner":
         from app.services.smb_excel import build_smb_workbook
-        output, filename = build_smb_workbook(db, req, ids)
+        # One SMB{k} sheet per SCB; single inverter -> INV{n}.xlsx, several -> a .zip.
+        output, filename, ctype = build_smb_workbook(db, req, ids)
     else:
         from app.services import report_excel
         data, filename = report_excel.build_multi_equipment_workbook(req, ids)
-        output = io.BytesIO(data)
+        output, ctype = io.BytesIO(data), xlsx_ctype
     return StreamingResponse(
         output,
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        media_type=ctype,
         headers={
             "Content-Disposition": f"attachment; filename={filename}",
             "Access-Control-Expose-Headers": "Content-Disposition",
@@ -507,12 +523,13 @@ def export_excel_async(req: ReportDataRequest):
                 export_jobs.update(job_id, status="running", progress=pct, message=msg)
 
             ctype = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            if req.equipment_type in ("T1 Isolation", "T2 Isolation"):
+            if req.equipment_type in ("T1 Isolation", "T2 Isolation", "Tracker"):
                 from app.services.t1_isolation_excel import generate_t1_isolation_export
                 data, filename, ctype = generate_t1_isolation_export(req, ids, prog)
             elif req.equipment_type == "String Combiner":
                 from app.services.smb_excel import generate_smb_workbook_streaming
-                data, filename = generate_smb_workbook_streaming(req, ids, prog)
+                # One SMB{k} sheet per SCB; several inverters come back as a .zip.
+                data, filename, ctype = generate_smb_workbook_streaming(req, ids, prog)
             else:
                 # All other equipment types → one worksheet per equipment.
                 from app.services import report_excel
@@ -582,6 +599,110 @@ def export_download(job_id: str):
     )
 
 
+# ── Direct-to-Downloads export (T1/T2 Isolation) — no ZIP ──────────────────────
+# Each device report is built in parallel (ProcessPool) and written straight to the
+# user's Downloads folder the moment it finishes. Progress is reported over the same
+# SSE endpoint (/export/progress/{job_id}); there is no file to download afterwards.
+@router.post("/export/excel/to-downloads")
+def export_excel_to_downloads(req: ReportDataRequest):
+    from app.services import export_jobs
+
+    if req.equipment_type not in ("T1 Isolation", "T2 Isolation", "Tracker"):
+        raise HTTPException(400, detail="Direct-to-Downloads export is only for T1/T2 Isolation")
+
+    ids = req.equipment_ids or [req.equipment_id]
+    job_id = export_jobs.create_job()
+    export_jobs.update(job_id, status="running", progress=0, message="Queued…")
+    logger.info("To-Downloads export queued | job=%s | type=%s | equipment(%d)=%s | tags=%d",
+                job_id, req.equipment_type, len(ids), ids, len(req.tags or []))
+
+    def run():
+        try:
+            from app.services.t1_isolation_excel import export_to_downloads
+
+            def prog(pct, msg):
+                export_jobs.update(job_id, status="running", progress=pct, message=msg)
+
+            result = export_to_downloads(req, ids, prog)
+            count = result.get("count", 0)
+            export_jobs.update(job_id, status="done", progress=100,
+                               message=f"Saved {count} tracker report(s) to Downloads.",
+                               json_result=result)
+        except Exception as e:  # noqa: BLE001 — surface failure to the client
+            logger.error("To-Downloads export job %s failed: %s", job_id, e, exc_info=True)
+            export_jobs.set_error(job_id, f"{type(e).__name__}: {e}")
+
+    threading.Thread(target=run, name=f"dl-export-{job_id}", daemon=True).start()
+    return {"job_id": job_id, "count": len(ids)}
+
+
+# ── Folder exports (NEW, additive): Tracker + per-SCB, one file per unit ────────
+# These write an organised folder tree to the server's disk (single-machine deploy),
+# reusing the SAME byte-identical renderers as the existing exports. They run as
+# background jobs and report over the same SSE endpoint (/export/progress/{job_id}).
+# The existing ZIP / to-Downloads exports are left untouched.
+@router.post("/export/trackers/to-folders")
+def export_trackers_to_folders(req: ReportDataRequest):
+    """Tracker (T1/T2 Isolation) → <TRACKER_EXPORT_DIR>\\Tracker{n}\\Tags_{a}_{b}.xlsx."""
+    from app.services import export_jobs
+
+    ids = req.equipment_ids or [req.equipment_id]
+    job_id = export_jobs.create_job()
+    export_jobs.update(job_id, status="running", progress=0, message="Queued…")
+    logger.info("Tracker folder export queued | job=%s | equipment(%d)=%s | tags=%d",
+                job_id, len(ids), ids, len(req.tags or []))
+
+    def run():
+        try:
+            from app.services.t1_isolation_excel import export_trackers_to_folders as _run
+
+            def prog(pct, msg):
+                export_jobs.update(job_id, status="running", progress=pct, message=msg)
+
+            result = _run(req, ids, prog)
+            export_jobs.update(job_id, status="done", progress=100,
+                               message=f"Saved {result.get('files', 0)} file(s) across "
+                                       f"{result.get('count', 0)} tracker folder(s).",
+                               json_result=result)
+        except Exception as e:  # noqa: BLE001 — surface failure to the client
+            logger.error("Tracker folder export job %s failed: %s", job_id, e, exc_info=True)
+            export_jobs.set_error(job_id, f"{type(e).__name__}: {e}")
+
+    threading.Thread(target=run, name=f"tracker-export-{job_id}", daemon=True).start()
+    return {"job_id": job_id, "count": len(ids)}
+
+
+@router.post("/export/smb/to-folders")
+def export_smb_to_folders(req: ReportDataRequest):
+    """String Combiner → <SMB_EXPORT_DIR>\\INV{n}\\SCB{k}.xlsx (one file per SCB)."""
+    from app.services import export_jobs
+
+    ids = req.equipment_ids or [req.equipment_id]
+    job_id = export_jobs.create_job()
+    export_jobs.update(job_id, status="running", progress=0, message="Queued…")
+    logger.info("SMB folder export queued | job=%s | inverters(%d)=%s | tags=%d",
+                job_id, len(ids), ids, len(req.tags or []))
+
+    def run():
+        try:
+            from app.services.smb_excel import export_smb_to_folders as _run
+
+            def prog(pct, msg):
+                export_jobs.update(job_id, status="running", progress=pct, message=msg)
+
+            result = _run(req, ids, prog)
+            export_jobs.update(job_id, status="done", progress=100,
+                               message=f"Saved {result.get('files', 0)} SCB file(s) across "
+                                       f"{result.get('count', 0)} inverter folder(s).",
+                               json_result=result)
+        except Exception as e:  # noqa: BLE001 — surface failure to the client
+            logger.error("SMB folder export job %s failed: %s", job_id, e, exc_info=True)
+            export_jobs.set_error(job_id, f"{type(e).__name__}: {e}")
+
+    threading.Thread(target=run, name=f"smb-export-{job_id}", daemon=True).start()
+    return {"job_id": job_id, "count": len(ids)}
+
+
 # ── Single-request STREAMING export (T1 Isolation) ─────────────────────────────
 # One prepare call stashes the request; the browser then downloads the streaming
 # GET, which builds the workbook/ZIP sequentially and streams it straight to disk
@@ -591,7 +712,7 @@ def export_download(job_id: str):
 def export_excel_stream_prepare(req: ReportDataRequest):
     from app.services import export_jobs
 
-    if req.equipment_type not in ("T1 Isolation", "T2 Isolation"):
+    if req.equipment_type not in ("T1 Isolation", "T2 Isolation", "Tracker"):
         raise HTTPException(400, detail="Streaming export is only available for T1/T2 Isolation")
 
     ids = req.equipment_ids or [req.equipment_id]

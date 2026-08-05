@@ -36,9 +36,26 @@ TIME_COL = "TimeCol"
 # INVERTER_01_GEN … INVERTER_25_GEN
 _GEN_COL_RE = re.compile(r"^INVERTER_(\d+)_GEN$")
 
+# Client business rule (NOT a data issue): INVERTER_25 exists in
+# [dbo].[INVERTER_DAILY_GEN] but must NOT appear anywhere in the Monthly Generation
+# Report — inverter list, charts, rankings, summary cards, tables, or totals. This
+# is a presentation-layer exclusion for MGR ONLY. The database is left untouched and
+# every other report (DGR, YGR, Reports, Scheduled, Preconfigured, Analytics) keeps
+# using the full column set via its own code path. Add labels here to exclude more.
+_MGR_EXCLUDED_INVERTERS = frozenset({"INVERTER_25"})
+
+
+def _inverter_label(column: str) -> str:
+    """INVERTER_01_GEN -> INVERTER_01"""
+    return column[: -len("_GEN")]
+
 
 def _gen_columns(db: Session) -> List[str]:
-    """Every INVERTER_xx_GEN column in the table, in inverter order."""
+    """
+    Every INVERTER_xx_GEN column in the table, in inverter order, with the
+    MGR-excluded inverters (see `_MGR_EXCLUDED_INVERTERS`) filtered out so they
+    never reach the report's list, totals, rankings, or charts.
+    """
     cols = schema_cache.get_columns(db, TABLE)
     if not cols:
         raise HTTPException(status_code=500, detail=f"Table {TABLE} not found in the database")
@@ -49,12 +66,8 @@ def _gen_columns(db: Session) -> List[str]:
             status_code=500,
             detail=f"No INVERTER_xx_GEN columns found in {TABLE}",
         )
-    return [c for _, c in sorted(matched)]
-
-
-def _inverter_label(column: str) -> str:
-    """INVERTER_01_GEN -> INVERTER_01"""
-    return column[: -len("_GEN")]
+    ordered = [c for _, c in sorted(matched)]
+    return [c for c in ordered if _inverter_label(c) not in _MGR_EXCLUDED_INVERTERS]
 
 
 def get_available_periods(db: Session) -> Dict[str, Any]:

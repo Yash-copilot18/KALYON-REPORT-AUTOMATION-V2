@@ -158,6 +158,22 @@ export const prepareExcelStreamJob = (payload) =>
 export const exportStreamUrl = (jobId) =>
   `${api.defaults.baseURL}/api/v1/reports-v2/export/excel/stream/${jobId}`
 
+// Direct-to-Downloads export (T1/T2 Isolation): the backend builds each device
+// report in parallel and saves each .xlsx into the Downloads folder as it finishes
+// (no ZIP, no browser download). Returns a job id; progress via exportProgressUrl.
+export const startExcelToDownloads = (payload) =>
+  api.post('/api/v1/reports-v2/export/excel/to-downloads', payload)
+
+// Folder exports (NEW, additive): one Excel file per unit, organised into folders on
+// the server's disk. Progress is reported over the same SSE endpoint (exportProgressUrl).
+//   Tracker → <TRACKER_EXPORT_DIR>\Tracker{n}\Tags_{a}_{b}.xlsx
+//   SMB     → <SMB_EXPORT_DIR>\INV{n}\SCB{k}.xlsx
+export const startTrackerFolderExport = (payload) =>
+  api.post('/api/v1/reports-v2/export/trackers/to-folders', payload)
+
+export const startSmbFolderExport = (payload) =>
+  api.post('/api/v1/reports-v2/export/smb/to-folders', payload)
+
 export const fetchReportSummary = (payload) =>
   api.post('/api/v1/reports-v2/summary', payload)
 
@@ -381,6 +397,31 @@ export const sendScheduledEmail = (payload) =>
 
 export const sendTestEmail = (payload = {}) =>
   api.post('/api/v1/scheduled/test-email', payload)
+
+// ── Scheduled reports — database-backed CRUD + actions ──────────────────────
+export const fetchSchedules = () =>
+  api.get('/api/v1/scheduled/schedules')
+
+export const createSchedule = (payload) =>
+  api.post('/api/v1/scheduled/schedules', payload)
+
+export const updateSchedule = (id, payload) =>
+  api.put(`/api/v1/scheduled/schedules/${id}`, payload)
+
+export const deleteSchedule = (id) =>
+  api.delete(`/api/v1/scheduled/schedules/${id}`)
+
+export const runSchedule = (id) =>
+  api.post(`/api/v1/scheduled/schedules/${id}/run`)
+
+export const pauseSchedule = (id) =>
+  api.post(`/api/v1/scheduled/schedules/${id}/pause`)
+
+export const resumeSchedule = (id) =>
+  api.post(`/api/v1/scheduled/schedules/${id}/resume`)
+
+export const fetchScheduleRuns = (id) =>
+  api.get(`/api/v1/scheduled/schedules/${id}/runs`)
 
 // ── Users ──────────────────────────────────────────────────────────────────
 export const fetchUsers = () =>
