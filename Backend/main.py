@@ -1,7 +1,3 @@
-from fastapi import FastAPI
+from app.main import app
 
-app = FastAPI()
-
-@app.get("/")
-def root():
-    return {"message": "Kalyan Backend Running"}
+__all__ = ["app"]
