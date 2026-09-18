@@ -166,6 +166,41 @@ def resolve_downloads_dir() -> str:
     return path
 
 
+def _safe_report_folder(name: str) -> str:
+    """Filesystem-safe, human-readable subfolder name for a report type."""
+    cleaned = "".join(ch if (ch.isalnum() or ch in " &-_") else "_" for ch in str(name or "")).strip()
+    return cleaned or "General"
+
+
+def resolve_reports_dir(report_type: str | None = None) -> str:
+    """
+    The single ROOT that holds every on-disk report export: one "Reports" folder, with
+    one subfolder PER report type inside it — Reports\\<Report Type>\\… — created on
+    demand. This is the storage layout the client asked for:
+
+        Reports\\
+          ├── Tracker\\
+          ├── String Combiner\\
+          ├── <any other report type>\\
+          └── …
+
+    The per-type subfolder name is the LIVE equipment/report type passed in — nothing is
+    hardcoded, so every current and future report type automatically lands under Reports
+    without touching this function. Base location is configurable via REPORTS_EXPORT_DIR
+    and otherwise defaults to <Downloads>\\Reports (the interactive user's Downloads,
+    resolved by resolve_downloads_dir). Always returns an ABSOLUTE path and creates it.
+    """
+    base = os.environ.get("REPORTS_EXPORT_DIR")
+    base = os.path.abspath(os.path.expandvars(base)) if base else os.path.join(resolve_downloads_dir(), "Reports")
+    os.makedirs(base, exist_ok=True)
+
+    if report_type:
+        base = os.path.join(base, _safe_report_folder(report_type))
+        os.makedirs(base, exist_ok=True)
+    logger.info("Reports dir = %s", base)
+    return base
+
+
 def verify_files_written(paths) -> None:
     """
     Raise RuntimeError if any expected output file is missing or empty, so a failed

@@ -38,18 +38,18 @@ export default function Sidebar() {
         sidebarCollapsed ? 'w-14' : 'w-[220px]'
       }`}
     >
-      {/* Logo */}
-      <div className="flex items-center gap-2.5 px-4 border-b border-ge-border min-h-[52px]">
-        <div className="flex-shrink-0 w-7 h-7 rounded-md flex items-center justify-center text-xs font-bold text-black"
-          style={{ background: 'linear-gradient(135deg,#00d4aa,#0099ff)' }}>
-          GE
-        </div>
-        {!sidebarCollapsed && (
-          <div className="overflow-hidden">
-            <div className="text-[12px] font-semibold text-ge-text1 whitespace-nowrap">KALYON NIGDE 130 MW</div>
-            <div className="text-[10px] font-mono text-ge-text3 whitespace-nowrap">TURKEY</div>
-          </div>
-        )}
+      {/* Logo — the exact Trinity Touch image (public/trinity-touch-logo.png), replacing the
+          former KALYON NIGDE 130 MW / TURKEY block and the old GE chip. The PNG already carries
+          its OWN opaque white background, so no extra chip/background/padding is added around it
+          (that was the source of the empty gap) — it sits flush in the 52px header area, sized to
+          fill it neatly. object-contain preserves the original proportions (no stretch/crop).
+          Rendered from the shared Sidebar, so the spacing is identical on every page. */}
+      <div className={`flex items-center border-b border-ge-border min-h-[52px] ${sidebarCollapsed ? 'justify-center px-2' : 'px-4'}`}>
+        <img
+          src="/trinity-touch-logo.png"
+          alt="Trinity Touch"
+          className={`object-contain ${sidebarCollapsed ? 'h-8 w-10' : 'h-10 max-w-full'}`}
+        />
       </div>
 
       {/* Nav */}

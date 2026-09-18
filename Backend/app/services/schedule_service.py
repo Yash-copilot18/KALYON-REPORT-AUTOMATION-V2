@@ -59,19 +59,28 @@ def _add_months(d: datetime, months: int) -> datetime:
     return d.replace(year=year, month=month, day=min(d.day, last))
 
 
-# Scheduled Reports supports ONLY these three generation reports. The tuple values
-# are the backend equipment_type keys; the UI shows them as DGR / MGR / YGR.
+# The three generation reports. They keep their OWN dedicated builders (DGR/MGR/YGR);
+# every OTHER equipment/report type the app exposes is generated through the generic
+# Reports export path (build_multi_equipment_workbook / SMB / Tracker builders).
 #   "Daily Generation"   → DGR (registry type, INVERTER_DAILY_GEN)
 #   "Monthly Generation" → MGR (registry type, INVERTER_MONTHLY_GEN)
 #   "Yearly Generation"  → YGR (plant-level, generated via ygr_service)
-SUPPORTED_REPORT_TYPES = ("Daily Generation", "Monthly Generation", "Yearly Generation")
+GENERATION_REPORT_TYPES = ("Daily Generation", "Monthly Generation", "Yearly Generation")
+# Retained name for backward compatibility (imported by the router).
+SUPPORTED_REPORT_TYPES = GENERATION_REPORT_TYPES
 
 # Default time-of-day for scheduled execution — 8:30 PM (client requirement).
 DEFAULT_SCHEDULE_TIME = "20:30"
 
 
 def is_supported_type(equipment_type: Optional[str]) -> bool:
-    return (equipment_type or "").strip() in SUPPORTED_REPORT_TYPES
+    """
+    Scheduling now supports EVERY equipment/report type the application exposes: the
+    three generation reports use their dedicated builders, and all other equipment
+    types are generated through the same generic Reports export path a manual export
+    uses. So any non-empty report type is schedulable.
+    """
+    return bool((equipment_type or "").strip())
 
 
 def _parse_time(value: Optional[str]) -> tuple:
@@ -87,13 +96,26 @@ def _parse_time(value: Optional[str]) -> tuple:
 
 
 def compute_next_run(frequency: str, base: Optional[datetime] = None,
-                     schedule_time: Optional[str] = DEFAULT_SCHEDULE_TIME) -> datetime:
+                     schedule_time: Optional[str] = DEFAULT_SCHEDULE_TIME,
+                     *, allow_today: bool = False) -> datetime:
     """
     Next fire time one frequency-step after `base`, pinned to `schedule_time`
     (HH:MM, default 20:30). The time-of-day lives in next_run itself, so no schema
     change is needed to store the schedule time.
+
+    `allow_today` — used when a schedule is CONFIGURED (created, re-timed, resumed):
+    if today's occurrence of `schedule_time` is still in the future, that is the next
+    run, so a schedule created at 14:40 for 20:30 fires TONIGHT rather than tomorrow.
+    It stays False when advancing the clock AFTER a run: there the next fire must be
+    strictly a full step later, otherwise a run at 12:17:07 for 12:17 would set
+    next_run back to 12:17:00 — already past — and re-fire on every tick.
     """
     base = base or datetime.now()
+    h, m = _parse_time(schedule_time)
+    if allow_today:
+        today_at = base.replace(hour=h, minute=m, second=0, microsecond=0)
+        if today_at > base:
+            return today_at
     f = (frequency or "Daily").strip().lower()
     if f == "weekly":
         nxt = base + timedelta(days=7)
@@ -101,7 +123,6 @@ def compute_next_run(frequency: str, base: Optional[datetime] = None,
         nxt = _add_months(base, 1)
     else:
         nxt = base + timedelta(days=1)     # Daily (default)
-    h, m = _parse_time(schedule_time)
     return nxt.replace(hour=h, minute=m, second=0, microsecond=0)
 
 
@@ -144,32 +165,30 @@ def to_row(s: ReportSchedule, *, fallback_recipient: str = "") -> Dict:
 # ── CRUD ─────────────────────────────────────────────────────────────────────
 def list_schedules(db: Session) -> List[ReportSchedule]:
     """
-    Only schedules for the currently-supported report types (DGR / MGR / YGR) are
-    returned — schedules created for now-removed report types stay in the database
-    (they are marked Paused by `deactivate_unsupported_schedules`) but are hidden.
+    Every schedule, newest first. All equipment/report types are supported now, so
+    none are hidden by type.
     """
     return (db.query(ReportSchedule)
-            .filter(ReportSchedule.equipment_type.in_(SUPPORTED_REPORT_TYPES))
             .order_by(ReportSchedule.id.desc())
             .all())
 
 
 def deactivate_unsupported_schedules(db: Session) -> int:
     """
-    Mark every schedule whose report type is no longer supported as Paused (inactive)
-    WITHOUT deleting it — so the background scheduler never runs it and it disappears
-    from the UI, but its history is preserved. Idempotent; safe to call at startup.
-    Returns how many were changed.
+    Historically this paused schedules whose report type was no longer supported.
+    Scheduling now supports every equipment/report type, so the only rows paused here
+    are ones with a BLANK report type (a data-integrity issue — they can't generate).
+    Idempotent; safe to call at startup. Returns how many were changed.
     """
     stale = (db.query(ReportSchedule)
-             .filter(~ReportSchedule.equipment_type.in_(SUPPORTED_REPORT_TYPES),
+             .filter((ReportSchedule.equipment_type.is_(None)) | (ReportSchedule.equipment_type == ""),
                      ReportSchedule.status != "Paused")
              .all())
     for s in stale:
         s.status = "Paused"
     if stale:
         db.commit()
-        logger.info("Deactivated %d schedule(s) of unsupported report type(s).", len(stale))
+        logger.info("Paused %d schedule(s) with no report type.", len(stale))
     return len(stale)
 
 
@@ -190,8 +209,15 @@ def create_schedule(db: Session, data: Dict) -> ReportSchedule:
         report_format=_normalize_format(data.get("format")),
         frequency=freq,
         status=data.get("status") or "Active",
-        recipients=(data.get("recipients") or "").strip() or None,
-        next_run=compute_next_run(freq, schedule_time=sched_time),
+        # Persist the destination ON the schedule row so the saved schedule carries
+        # everything the run needs. When the form supplies none, the currently
+        # configured recipient is stored, so a later .env change never silently
+        # re-targets an existing schedule. Only the address is stored — never any
+        # SMTP credential.
+        recipients=(normalize_recipients(data.get("recipients"))
+                    or email_service.get_recipient_email() or None),
+        # allow_today: a schedule created before its time-of-day fires the SAME day.
+        next_run=compute_next_run(freq, schedule_time=sched_time, allow_today=True),
     )
     db.add(s)
     db.commit()
@@ -216,7 +242,9 @@ def update_schedule(db: Session, schedule_id: int, data: Dict) -> Optional[Repor
         s.agg_function = data.get("agg") or data.get("agg_function") or s.agg_function
     if "format" in data:   s.report_format = _normalize_format(data.get("format"))
     if "recipients" in data:
-        s.recipients = (data.get("recipients") or "").strip() or None
+        # The full edited list, normalised to the column's comma format. Clearing
+        # every chip stores NULL, which falls back to the configured address.
+        s.recipients = normalize_recipients(data.get("recipients")) or None
     # Current configured time-of-day (from next_run) — preserved unless the user
     # supplies a new one, so editing other fields never resets the schedule time.
     cur_time = s.next_run.strftime("%H:%M") if s.next_run else DEFAULT_SCHEDULE_TIME
@@ -224,7 +252,8 @@ def update_schedule(db: Session, schedule_id: int, data: Dict) -> Optional[Repor
     new_freq = data.get("freq") or data.get("frequency") or s.frequency
     if ("freq" in data or "frequency" in data or "time" in data) and \
        (new_freq != s.frequency or new_time != cur_time):
-        s.next_run = compute_next_run(new_freq, schedule_time=new_time)   # re-base
+        # re-base; allow_today so a newly-set time later today fires today
+        s.next_run = compute_next_run(new_freq, schedule_time=new_time, allow_today=True)
     s.frequency = new_freq
     db.commit()
     db.refresh(s)
@@ -249,10 +278,11 @@ def set_status(db: Session, schedule_id: int, status: str) -> Optional[ReportSch
         return None
     s.status = "Paused" if status.lower() == "paused" else "Active"
     # Resuming re-bases next_run so a long-paused schedule doesn't fire immediately,
-    # keeping the configured time-of-day.
+    # keeping the configured time-of-day. allow_today so resuming in the morning a
+    # schedule set for the evening still runs tonight rather than tomorrow.
     if s.status == "Active" and (s.next_run is None or s.next_run < datetime.now()):
         cur_time = s.next_run.strftime("%H:%M") if s.next_run else DEFAULT_SCHEDULE_TIME
-        s.next_run = compute_next_run(s.frequency, schedule_time=cur_time)
+        s.next_run = compute_next_run(s.frequency, schedule_time=cur_time, allow_today=True)
     db.commit()
     db.refresh(s)
     logger.info("Schedule %s -> %s", schedule_id, s.status)
@@ -267,13 +297,35 @@ def list_runs(db: Session, schedule_id: int, limit: int = 50) -> List[ScheduleRu
 
 
 # ── Execution (real report, reusing the Reports module) ──────────────────────
-def _resolve_recipient(s: ReportSchedule) -> str:
-    """Per-schedule recipient if set (first of a comma list), else the .env one."""
-    if s.recipients:
-        first = s.recipients.split(",")[0].strip()
-        if first:
-            return first
-    return email_service.get_recipient_email()
+def _resolve_recipients(s: ReportSchedule) -> List[str]:
+    """
+    EVERY recipient saved on the schedule, in order. The `recipients` column has
+    always held a comma-separated list; this now returns all of them instead of
+    only the first, so one schedule e-mails its report to everybody configured on
+    it. A schedule with no recipients of its own (older rows, or one saved before
+    the address was stored) falls back to the .env address, so single-recipient
+    and legacy schedules keep working untouched.
+    """
+    saved = email_service.parse_recipients(s.recipients)
+    if saved:
+        return saved
+    fallback = email_service.get_recipient_email()
+    return [fallback] if fallback else []
+
+
+def normalize_recipients(value) -> str:
+    """
+    Recipients as stored in the column: an ordered, de-duplicated comma-separated
+    string. Accepts either a list (the API's new form) or a string (its original
+    form), so the storage format — and every existing row — is unchanged.
+    """
+    return ", ".join(email_service.parse_recipients(value))
+
+
+def invalid_recipients(value) -> List[str]:
+    """Addresses in `value` that fail validation — for a precise API error."""
+    return [a for a in email_service.parse_recipients(value)
+            if not email_service.is_valid_email(a)]
 
 
 # Yearly Generation Report columns (plant-level, from ygr_service) + their labels.
@@ -591,17 +643,114 @@ def _build_dgr_file(db: Session, s: ReportSchedule):
     return data, f"{base}.xlsx", XLSX_MIME[0], XLSX_MIME[1]
 
 
+# Intervals accepted for generic equipment reports (mirrors the Reports page).
+_EQUIP_VALID_INTERVALS = {"raw", "1min", "5min", "15min", "30min", "hourly", "daily", "monthly"}
+
+
+def _build_equipment_file(db: Session, s: ReportSchedule):
+    """
+    Generic equipment/report-type file for a schedule — generated through the SAME
+    services a manual Reports export uses, so scheduled output matches manual output:
+      · String Combiner             → smb_excel.build_smb_workbook (per-SMB sheets)
+      · Tracker / T1 / T2 Isolation → t1_isolation_excel.generate_t1_isolation_export
+      · every other equipment type  → report_excel.build_multi_equipment_workbook
+      · PDF                         → report_pdf from the same get_report_data rows
+
+    Scheduling uses a SINGLE date; the report covers that whole day. The equipment's
+    full column set is auto-discovered (exactly like the Reports page auto-selecting
+    every available tag) — nothing about the query/calculation logic changes.
+    """
+    from app.schemas.reports_schema import ReportDataRequest
+    from app.repositories.reports_repository import ReportsRepository
+
+    eq_id = (s.equipment_id or "").strip()
+    if not eq_id:
+        raise ValueError(f"Schedule id={s.id} ({s.equipment_type}) has no equipment identifier")
+
+    day     = s.to_date or s.from_date or date.today()
+    from_dt = datetime.combine(day, datetime.min.time())
+    to_dt   = datetime.combine(day, datetime.max.time().replace(microsecond=0))
+    interval = s.interval if s.interval in _EQUIP_VALID_INTERVALS else "hourly"
+    agg      = s.agg_function or "avg"
+
+    # Full tag set for this equipment. ReportDataRequest requires ≥1 tag; the workbook
+    # builders re-discover each equipment's own columns, so this also drives the report.
+    tag_cols = [t["column_name"] for t in ReportsRepository.get_tags(db, s.equipment_type, eq_id)]
+    if not tag_cols:
+        raise ValueError(f"No columns found for {s.equipment_type} / {eq_id}")
+
+    req = ReportDataRequest(
+        equipment_type=s.equipment_type, equipment_id=eq_id, tags=tag_cols,
+        from_datetime=from_dt, to_datetime=to_dt,
+        interval=interval, agg_function=agg, page=1, page_size=100000,
+    )
+
+    logger.info(
+        "[EQUIP] Generating | type=%s | equipment=%s | date=%s | interval=%s | agg=%s | tags=%d",
+        s.equipment_type, eq_id, day.isoformat(), interval, agg, len(tag_cols),
+    )
+
+    fmt      = _normalize_format(s.report_format)
+    stamp    = datetime.now().strftime("%d-%m-%Y")
+    safe_eid = eq_id.replace(" ", "_").replace("/", "_")
+
+    # ── PDF (generic single-equipment table from the same report data) ───────────
+    if fmt == "PDF":
+        from app.services.reports_service import ReportsService
+        result  = ReportsService.get_report_data(db, req)
+        columns = result.get("columns") or ["timestamp"]
+        rows    = result.get("rows", []) or []
+        tag_label = {
+            t["column_name"]: (f"{t['tag']} ({t['unit']})" if t.get("unit") else (t.get("tag") or t["column_name"]))
+            for t in ReportsRepository.get_tags(db, s.equipment_type, eq_id)
+        }
+        def label_fn(c):  # noqa: E306
+            if c == "timestamp":  return "Timestamp"
+            if c == "_equipment": return "Equipment"
+            return tag_label.get(c, c)
+        metadata = [
+            ("Project Name",          PROJECT_NAME),
+            ("Report Name",           f"{s.equipment_type} Report"),
+            ("Equipment",             eq_id),
+            ("Report Date",           day.strftime("%d/%m/%Y")),
+            ("Time Interval",         intervals.interval_label(interval)),
+            ("Rows",                  str(len(rows))),
+            ("Generated Date & Time", datetime.now().strftime(_FMT)),
+        ]
+        data = build_pdf_bytes(columns, rows, title=f"{s.equipment_type} Report — {eq_id}",
+                               metadata=metadata, header_fn=label_fn)
+        return data, f"{safe_eid}_Report_{stamp}.pdf", PDF_MIME[0], PDF_MIME[1]
+
+    # ── Excel — dispatch to the type's specific builder (same as manual export) ──
+    if s.equipment_type == "String Combiner":
+        from app.services.smb_excel import build_smb_workbook
+        out, filename, ctype = build_smb_workbook(db, req, [eq_id])
+        data = out.getvalue() if hasattr(out, "getvalue") else out
+        main, _, sub = ctype.partition("/")
+        return data, filename, main or XLSX_MIME[0], sub or XLSX_MIME[1]
+
+    if s.equipment_type in ("Tracker", "T1 Isolation", "T2 Isolation"):
+        from app.services.t1_isolation_excel import generate_t1_isolation_export
+        data, filename, ctype = generate_t1_isolation_export(req, [eq_id], None)
+        main, _, sub = ctype.partition("/")
+        return data, filename, main or XLSX_MIME[0], sub or XLSX_MIME[1]
+
+    from app.services import report_excel
+    data, filename = report_excel.build_multi_equipment_workbook(req, [eq_id])
+    return data, filename, XLSX_MIME[0], XLSX_MIME[1]
+
+
 def _build_report_file(db: Session, s: ReportSchedule):
     """
     Build the real report file for a schedule. Returns
     (data, filename, mime_main, mime_sub). Raises on failure (caller logs it).
 
-    Scheduled Reports supports ONLY DGR / MGR / YGR, and each is generated through the
-    SAME service its manual counterpart on the Reports page uses, so scheduled ==
-    manual output — there is exactly ONE code path per report, no duplicated logic:
+    Each type is generated through the SAME service its manual counterpart uses, so
+    scheduled output == manual output — no duplicated query/calculation logic:
       · DGR ("Daily Generation")   → get_report_data over [dbo].[PPC]  (+ counter rule)
       · MGR ("Monthly Generation") → mgr_service   (INVERTER_DAILY_GEN aggregation)
       · YGR ("Yearly Generation")  → ygr_service   (plant-level month-by-month)
+      · any other equipment type   → _build_equipment_file (generic Reports export)
     """
     if s.equipment_type == "Daily Generation":
         return _build_dgr_file(db, s)
@@ -609,9 +758,9 @@ def _build_report_file(db: Session, s: ReportSchedule):
         return _build_mgr_file(db, s)
     if s.equipment_type == "Yearly Generation":
         return _build_ygr_file(db, s)
-    # Unsupported types are rejected at the API and hidden in the UI; reaching here is a
-    # data-integrity error, not a report to silently mis-generate.
-    raise ValueError(f"Unsupported scheduled report type: {s.equipment_type!r}")
+    # Every other supported equipment/report type (Inverter, String Combiner, WMS, PPC,
+    # Tracker, Alarms, …) → the SAME generic Reports export path used by manual exports.
+    return _build_equipment_file(db, s)
 
 
 def execute_schedule(db: Session, s: ReportSchedule, *, kind: str = "RUN") -> Dict:
@@ -620,11 +769,12 @@ def execute_schedule(db: Session, s: ReportSchedule, *, kind: str = "RUN") -> Di
     last_run / next_run. Returns a status dict (also the Run-Now HTTP response).
     """
     t0 = datetime.now()
-    recipient = _resolve_recipient(s)
+    recipients = _resolve_recipients(s)                 # ALL saved addresses
+    recipient = ", ".join(recipients)                   # display/report form
     fmt = _normalize_format(s.report_format)
 
-    logger.info("[%s] Executing schedule id=%s -> %s/%s | fmt=%s | to=%s",
-                kind, s.id, s.equipment_type, s.equipment_id, fmt, recipient)
+    logger.info("[%s] Executing schedule id=%s -> %s/%s | fmt=%s | to=%d recipient(s) %s",
+                kind, s.id, s.equipment_type, s.equipment_id, fmt, len(recipients), recipients)
 
     run = ScheduleRun(schedule_id=s.id, execution_time=t0, status="Failed",
                       report=None, data_source="database", error=None)
@@ -675,12 +825,13 @@ def execute_schedule(db: Session, s: ReportSchedule, *, kind: str = "RUN") -> Di
         "The requested report is attached.\n"
     )
     result = email_service.send_email_with_attachment(
-        to_email=recipient, subject=subject, body=body,
+        to_email=recipients, subject=subject, body=body,
         attachment_bytes=data, attachment_filename=filename,
         mime_main=mime_main, mime_sub=mime_sub,
     )
     if result.get("success"):
-        logger.info("[%s] schedule id=%s -> SUCCESS | %s", kind, s.id, filename)
+        logger.info("[%s] schedule id=%s -> SUCCESS | %s | delivered to %d recipient(s)",
+                    kind, s.id, filename, len(recipients))
         return _finalize("Success")
     run.error = result.get("error")
     logger.error("[%s] schedule id=%s -> email FAILED | %s", kind, s.id, run.error)
@@ -706,7 +857,6 @@ def run_due_schedules() -> int:
         now = datetime.now()
         due = (db.query(ReportSchedule)
                .filter(ReportSchedule.status == "Active",
-                       ReportSchedule.equipment_type.in_(SUPPORTED_REPORT_TYPES),
                        ReportSchedule.next_run.isnot(None),
                        ReportSchedule.next_run <= now)
                .all())

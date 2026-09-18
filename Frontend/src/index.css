@@ -90,12 +90,16 @@ html:not(.dark) {
   .pill-red     { @apply bg-red-900/40 text-red-400; }
   .pill-blue    { @apply bg-blue-900/40 text-blue-400; }
   .data-table   { @apply w-full border-collapse text-xs; }
+  /* Equal padding (px-3), equal row height (py-2 + whitespace-nowrap so a cell never
+     wraps to two lines), and middle vertical-alignment so headers and values sit on the
+     same baseline. `text-left` is the DEFAULT only; a column's `align` overrides it on
+     BOTH the th and td, keeping headers lined up with their values. */
   .data-table th {
-    @apply text-left px-3 py-2 text-[10px] text-ge-text3 uppercase tracking-wider font-semibold
-           border-b border-ge-border bg-ge-surface font-mono;
+    @apply text-left align-middle whitespace-nowrap px-3 py-2 text-[10px] text-ge-text3
+           uppercase tracking-wider font-semibold border-b border-ge-border bg-ge-surface font-mono;
   }
   .data-table td {
-    @apply px-3 py-2 border-b border-ge-border text-ge-text2;
+    @apply align-middle whitespace-nowrap px-3 py-2 border-b border-ge-border text-ge-text2;
   }
   .data-table tr:hover td { @apply bg-ge-elevated text-ge-text1; }
   .kpi-card {
@@ -105,8 +109,17 @@ html:not(.dark) {
     content: '';
     @apply absolute top-0 left-0 right-0 h-0.5;
   }
+  /* KPI accent bars.
+     NOTE: the colour class is applied dynamically (`kpi-${color}`), so Tailwind's
+     content scan — which only reads the js/jsx sources, never this stylesheet — does
+     not see these class names and strips these rules from the build. Every KPI card
+     therefore renders with a transparent ::before, i.e. no accent bar. The blue rule
+     used to be the one exception: the literal string "kpi-blue" appears in a code
+     comment in Analytics.jsx, which kept it in the build and drew a blue line across
+     the top of the Current Power and Monthly Energy cards while every other card had
+     none. That rule is removed so all KPI cards share the same plain
+     border/background. */
   .kpi-green::before  { background: linear-gradient(90deg, #10b981, transparent); }
-  .kpi-blue::before   { background: linear-gradient(90deg, #0099ff, transparent); }
   .kpi-amber::before  { background: linear-gradient(90deg, #f59e0b, transparent); }
   .kpi-purple::before { background: linear-gradient(90deg, #7c3aed, transparent); }
   .kpi-red::before    { background: linear-gradient(90deg, #ef4444, transparent); }

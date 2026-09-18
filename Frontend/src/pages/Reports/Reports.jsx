@@ -1,10 +1,11 @@
 // src/pages/Reports/Reports.jsx
 import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate, useLocation } from 'react-router-dom'
 import { PageHeader, FormRow, FormGroup, Skeleton, Spinner } from '../../components/Common'
 import { useApp } from '../../utils/AppContext'
 import {
-  INTERVALS, INTERVAL_LABELS, AGG_OPTIONS, DEFAULT_AGG,
+  INTERVAL_LABELS, AGG_OPTIONS, DEFAULT_AGG,
+  intervalsForRange, resolveInterval,
   showsAggregation, withAggregation,
 } from '../../utils/intervals'
 import { getPreset, hasPreset, presetEquipmentIds } from '../../utils/reportPresets'
@@ -24,6 +25,7 @@ import {
   prepareExcelStreamJob,
   exportStreamUrl,
   startExcelToDownloads,
+  createSavedReport,
 } from '../../services/api'
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
@@ -67,39 +69,15 @@ const V_COL_MIN    = 60    // engage column virtualization only when cols exceed
 const V_COL_OVERSCAN = 3   // extra columns rendered left/right of the viewport
 const V_DEFAULT_VIEW_W = 1200  // fallback viewport width before the container is measured
 
-// T1/T2 Isolation column order — MUST match the Excel export exactly
-// (backend `_order_isolation_columns`): group every field of the same numeric ID
-// together, IDs ascending, fields alphabetical within an ID
-// (ALARM, BATTERY_LEVEL, ELEVATION_POSITION, ELEVATION_SETPOINT, MAX_MOTOR_CURRENT,
-// OPERATION_MODE, …). Grouping is derived dynamically from the {FIELD}_ID{n} column
-// names — no hardcoded field list or ID count. A field missing for an ID is simply
-// absent (its column isn't in the list), so it is skipped and the ID's remaining
-// fields still follow in order. Columns that don't match keep their order and go
-// last. V8's sort is stable (ES2019), so equal-key columns retain their input order.
-const ISO_ID_COL_RE = /^(.*)_ID(\d+)$/i
-
-function orderIsolationColumns(cols) {
-  return [...cols].sort((a, b) => {
-    const ma = ISO_ID_COL_RE.exec(a)
-    const mb = ISO_ID_COL_RE.exec(b)
-    if (ma && mb) {
-      const d = Number(ma[2]) - Number(mb[2])          // ID ascending
-      if (d !== 0) return d
-      const fa = ma[1].toUpperCase(), fb = mb[1].toUpperCase()
-      return fa < fb ? -1 : fa > fb ? 1 : 0            // field alphabetical
-    }
-    if (ma) return -1                                  // ID columns before non-ID
-    if (mb) return 1
-    return 0                                           // both non-ID: keep order
-  })
-}
-
 // Presentation-only: map an internal isolation table id (T1_IS3 / T2_IS13) to its
-// Tracker display name (Tracker3 / Tracker13). Pure and id-shaped, so any non-isolation
-// equipment id passes through unchanged. The underlying value/id is never mutated.
+// tracker display name in the client's required format — IS03 / IS13 (always two
+// digits, leading zero; three+ digits keep their length). Pure and id-shaped, so any
+// non-isolation equipment id — and an already-formatted "IS03" from the backend —
+// passes through unchanged. The underlying value/id is never mutated — only what the
+// operator sees.
 function trackerDisplayName(id) {
   const m = /^T\d+_IS0*(\d+)$/i.exec(String(id ?? ''))
-  return m ? `Tracker${m[1]}` : id
+  return m ? `IS${String(m[1]).padStart(2, '0')}` : id
 }
 
 function renderCell(col, val) {
@@ -114,9 +92,22 @@ function renderCell(col, val) {
   return <span className="font-mono text-ge-text2 text-[11px]">{String(val)}</span>
 }
 
-// Fixed per-column widths (px). Timestamp and Equipment are wider so full values
-// like "31/12/2024 23:59:59" and "INVERTER1_SMB" are never clipped.
-const colWidth = (c) => (c.isTs ? 190 : c.key === '_equipment' ? 150 : 120)
+// Per-column width (px), sized so the HEADER is fully readable in AT MOST two wrapped
+// lines (never truncated with "…"), and data like "31/12/2024 23:59:59" never clips.
+// ~6.3px per char at the 10px header font: half the label fits on each of two lines,
+// and the longest single word is guaranteed to fit one line. Clamped so the table
+// stays horizontally scrollable rather than gigantic. Header + data share this width
+// (via <colgroup>), so columns stay perfectly aligned.
+const colWidth = (c) => {
+  if (c.isTs) return 200
+  if (c.key === '_equipment') return 150
+  const label = String(c.label || '')
+  const CH = 6.3, PAD = 22
+  const longestWord = label.split(/\s+/).reduce((m, w) => Math.max(m, w.length), 0)
+  const twoLine = Math.ceil(label.length / 2)          // chars/line for a 2-line wrap
+  const chars = Math.max(longestWord, twoLine)
+  return Math.min(210, Math.max(120, Math.round(chars * CH + PAD)))
+}
 
 const _cellStyle = {
   height: V_ROW_H, paddingTop: 0, paddingBottom: 0, boxSizing: 'border-box',
@@ -228,9 +219,18 @@ function VirtualDataTable({ cols = [], rows = [] }) {
           <tr>
             {leftPad > 0 && <th aria-hidden className="sticky top-0 z-10" style={{ padding: 0, border: 0 }} />}
             {visCols.map(c => (
+              // Header fully visible: wraps to at most 2 lines (never "…"), centred
+              // horizontally + vertically, and the row height auto-adjusts to the
+              // wrapped text. Inline styles override the .data-table th nowrap/left.
               <th key={c.key} className="text-[10px] sticky top-0 z-10"
-                  style={{ height: V_ROW_H, overflow: 'hidden', textOverflow: 'ellipsis' }}>
-                {c.label}
+                  style={{ textAlign: 'center', verticalAlign: 'middle',
+                           whiteSpace: 'normal', padding: '5px 6px' }}>
+                <div style={{ display: '-webkit-box', WebkitLineClamp: 2,
+                              WebkitBoxOrient: 'vertical', overflow: 'hidden',
+                              whiteSpace: 'normal', wordBreak: 'break-word',
+                              lineHeight: 1.2, textAlign: 'center' }}>
+                  {c.label}
+                </div>
               </th>
             ))}
             {rightPad > 0 && <th aria-hidden className="sticky top-0 z-10" style={{ padding: 0, border: 0 }} />}
@@ -270,18 +270,27 @@ function todayDMY() {
 // is NOT hidden. The raw isolation types and the retired MBOX report are hidden here as
 // a belt-and-suspenders guard (the backend already omits them from /equipment-types).
 const HIDDEN_EQ_TYPES = new Set([
-  'Alarms', 'Temperature Report', 'Daily Generation',
+  // Kept out of the picker per client request (Daily Generation / Alarms). Their backend
+  // registry mappings are left intact — this only removes them from the dropdown.
+  'Alarms', 'Daily Generation',
+  // Backend-internal isolation/MBOX types, surfaced only through the merged 'Tracker'
+  // type — belt-and-suspenders guard (the backend already omits them from /equipment-types).
   'T1 Isolation', 'T2 Isolation', 'Tracker MBOX Status',
 ])
 
-// The equipment type that carries the T1/T2 isolation devices (shown as Tracker{n}).
-// Centralised so the isolation-specific UI behaviours (column ordering, export routing)
-// key off one predicate instead of scattered string comparisons.
-const isTrackerType = (t) => t === 'Tracker'
+// Display label for the Equipment Type dropdown. The stored VALUE stays 'Tracker'
+// (backend routing and presets key off it); only the visible text
+// reads 'Trackers' per the client's reference. Every other type shows its own name.
+const eqTypeLabel = (t) => (t === 'Tracker' ? 'Trackers' : t)
 
 // Multi-equipment table uses classic server-side pagination: the first page loads
 // with progress; Prev/Next fetch one page at a time (rows ordered by timestamp then
 // equipment, so every device appears on every page).
+// How long the From/To edits must settle before the range is shared with Analytics.
+// Long enough to coalesce a From-then-To change into one publish, short enough that
+// navigating straight to Analytics always finds the latest range.
+const RANGE_PUBLISH_MS = 400
+
 const DEFAULT_PAGE_SIZE = 100
 const PAGE_SIZE_OPTIONS = [50, 100, 250, 500]
 
@@ -307,7 +316,9 @@ function EquipmentMultiSelect({ eqList, selectedIds, setSelectedIds, disabled, l
     const q = eqSearch.toLowerCase()
     return eqList.filter(eq =>
       eq.display_name.toLowerCase().includes(q) ||
-      eq.equipment_id.toLowerCase().includes(q)
+      eq.equipment_id.toLowerCase().includes(q) ||
+      // Also match what the operator actually sees (e.g. "T03"), not just the raw id.
+      trackerDisplayName(eq.display_name).toLowerCase().includes(q)
     )
   }, [eqList, eqSearch])
 
@@ -483,24 +494,54 @@ function EquipmentMultiSelect({ eqList, selectedIds, setSelectedIds, disabled, l
   )
 }
 
-// ── Tag Selector (READ-ONLY) ──────────────────────────────────────────────────
-// Same layout/styling as before, but the panel is view-only: every available tag
-// is auto-selected upstream and shown in both lists; search, sort, Clear All and
-// every tag checkbox are disabled, so the user can inspect the selection but never
-// change it. `selected` is driven entirely by the parent's auto-select effect.
-function DynamicTagSelector({ tags, selected }) {
+// ── Tag Selector ─────────────────────────────────────────────────────────────
+// Interactive tag picker: Select All / Clear All above the list, a working search
+// filter, A→Z sort, and per-tag toggling. Every available tag is auto-selected
+// upstream when equipment changes, so the panel opens fully selected; the user can
+// then refine it. Only fully-available tags are selectable (partial ones are shown
+// greyed + locked). `selected` / `setSelected` are owned by the parent.
+function DynamicTagSelector({ tags, selected, setSelected }) {
+  const [search,  setSearch]  = useState('')
+  const [sortAsc, setSortAsc] = useState(false)
+
   const tagIndex = useMemo(() => {
     const map = {}
     tags.forEach((t, i) => { map[t.column_name] = i + 1 })
     return map
   }, [tags])
 
-  // Read-only → no filtering/sorting is possible, so every tag is always shown.
-  const displayed = tags
-
   const isAvail = t => t.available !== false
   const availableCount = useMemo(() => tags.filter(isAvail).length, [tags])
   const partialCount   = tags.length - availableCount
+
+  // Search filters ONLY what's DISPLAYED — it never mutates the full `tags` list, so
+  // clearing the search restores every tag (req 8). A→Z is an optional display sort.
+  const displayed = useMemo(() => {
+    const q = search.trim().toLowerCase()
+    let list = q
+      ? tags.filter(t =>
+          t.tag.toLowerCase().includes(q) || t.column_name.toLowerCase().includes(q))
+      : tags
+    if (sortAsc) list = [...list].sort((a, b) => a.tag.localeCompare(b.tag))
+    return list
+  }, [tags, search, sortAsc])
+
+  // Toggle one tag (available tags only). Select All / Clear All mirror this exact
+  // state, so a bulk select yields a Selected panel identical to picking each by hand.
+  const toggle = col => {
+    const tag = tags.find(t => t.column_name === col)
+    if (tag && !isAvail(tag)) return
+    setSelected(prev => {
+      const next = new Set(prev)
+      next.has(col) ? next.delete(col) : next.add(col)
+      return next
+    })
+  }
+
+  // Select All → EVERY available tag in the FULL list (not just the filtered/visible
+  // ones — req 3 & 9). Clear All → none (req 4).
+  const selectAll = () => setSelected(new Set(tags.filter(isAvail).map(t => t.column_name)))
+  const clearAll  = () => setSelected(new Set())
 
   return (
     <div>
@@ -511,24 +552,32 @@ function DynamicTagSelector({ tags, selected }) {
         <span className="text-[10px] font-mono text-ge-accent">{selected.size} selected</span>
       </div>
 
-      {/* Search + Sort — rendered exactly as before, but disabled (read-only). */}
-      <div className="flex items-center gap-2 mb-2">
-        <div className="relative flex-1">
-          <span className="absolute left-2.5 top-1/2 -translate-y-1/2 text-ge-text3 text-sm">🔍</span>
-          <input type="text" value="" readOnly disabled
-            placeholder="Search tags..." className="form-control pl-7 text-[12px]" />
-        </div>
-        <button className="btn btn-outline btn-sm" disabled>
-          A→Z
+      {/* Select All / Clear All — above the Available list (req 1 & 2). */}
+      <div className="flex items-center gap-2 mb-2 flex-wrap">
+        <button type="button" className="btn btn-outline btn-sm" onClick={selectAll}
+          disabled={availableCount === 0} title="Select every available tag">
+          ✓ Select All
         </button>
+        <button type="button" className="btn btn-outline btn-sm" onClick={clearAll}
+          disabled={selected.size === 0} title="Deselect all tags">
+          ✕ Clear All
+        </button>
+        <span className="ml-auto text-[11px] text-ge-text3 font-mono">
+          {selected.size} of {availableCount} selected
+        </span>
       </div>
 
-      {/* Quick actions — Clear All disabled (selection cannot be modified). */}
-      <div className="flex items-center gap-2 mb-2.5 flex-wrap">
-        <button className="btn btn-outline btn-sm" disabled>✕ Clear All</button>
-        <span className="ml-auto text-[11px] text-ge-text3 font-mono">
-          Showing: {displayed.length}
-        </span>
+      {/* Search + Sort — filters the displayed list only (full tag list is preserved). */}
+      <div className="flex items-center gap-2 mb-2.5">
+        <div className="relative flex-1">
+          <span className="absolute left-2.5 top-1/2 -translate-y-1/2 text-ge-text3 text-sm">🔍</span>
+          <input type="text" value={search} onChange={e => setSearch(e.target.value)}
+            placeholder="Search tags..." className="form-control pl-7 text-[12px]" />
+        </div>
+        <button type="button" className={`btn btn-sm ${sortAsc ? 'btn-primary' : 'btn-outline'}`}
+          onClick={() => setSortAsc(v => !v)} title="Sort A→Z">
+          A→Z
+        </button>
       </div>
 
       {partialCount > 0 && (
@@ -556,10 +605,11 @@ function DynamicTagSelector({ tags, selected }) {
                 const isSel = selected.has(tag.column_name)
                 return (
                 <div key={tag.column_name}
+                  onClick={() => avail && toggle(tag.column_name)}
                   title={avail ? '' : `Available in ${tag.available_in} of ${tag.total} selected equipment`}
-                  className={`flex items-center gap-2 px-2 py-1.5 cursor-default select-none
+                  className={`flex items-center gap-2 px-2 py-1.5 select-none
                              border-b border-ge-border last:border-b-0
-                             ${avail ? '' : 'opacity-50'}
+                             ${avail ? 'cursor-pointer hover:bg-ge-surface' : 'opacity-50 cursor-not-allowed'}
                              ${isSel ? 'bg-ge-blue/10' : ''}`}>
                   <span className="text-[9px] font-mono text-ge-text3 w-5 text-right flex-shrink-0">
                     {tagIndex[tag.column_name]}
@@ -600,8 +650,10 @@ function DynamicTagSelector({ tags, selected }) {
                   const tag = tags.find(t => t.column_name === col) || { tag: col, unit: '' }
                   return (
                     <div key={col}
-                      className="flex items-center gap-2 px-2.5 py-1.5 cursor-default select-none
-                                 border-b border-ge-border last:border-b-0 bg-ge-blue/10">
+                      onClick={() => toggle(col)}
+                      title="Remove from selection"
+                      className="flex items-center gap-2 px-2.5 py-1.5 cursor-pointer select-none
+                                 border-b border-ge-border last:border-b-0 bg-ge-blue/10 hover:bg-ge-blue/20">
                       <div className="w-3.5 h-3.5 rounded flex items-center justify-center
                                       text-[9px] flex-shrink-0 bg-ge-blue border border-ge-blue text-white">
                         ✓
@@ -610,6 +662,7 @@ function DynamicTagSelector({ tags, selected }) {
                       {tag.unit && (
                         <span className="text-[10px] font-mono text-ge-text3">{tag.unit}</span>
                       )}
+                      <span className="text-[11px] text-ge-text3 hover:text-ge-danger flex-shrink-0">✕</span>
                     </div>
                   )
                 })
@@ -624,7 +677,8 @@ function DynamicTagSelector({ tags, selected }) {
 // ── Main Page ──────────────────────────────────────────────────────────────────
 export default function Reports() {
   const navigate           = useNavigate()
-  const { showToast, registerRefresh } = useApp()
+  const location           = useLocation()
+  const { showToast, registerRefresh, setReportDateRange } = useApp()
 
   const [eqTypes,       setEqTypes]       = useState([])
   const [eqList,        setEqList]        = useState([])
@@ -657,6 +711,18 @@ export default function Reports() {
   const [warnExpanded, setWarnExpanded] = useState(false)
   const [pageLoading, setPageLoading] = useState(false)   // Prev/Next page fetch
   const [pageSize,    setPageSize]    = useState(DEFAULT_PAGE_SIZE)
+
+  // ── Save / restore a Preconfigured report ──────────────────────────────────
+  // `savingReport` drives the Save button spinner. Restoring a saved report opens
+  // the Reports page with a config to re-apply: `restoreRef` carries it through the
+  // async equipment→tags load cascade so the auto-select effects don't clobber the
+  // saved selection; `autoLoadRef` remembers a Run/Load request; `restoreToken`
+  // fires once the cascade finishes so an auto-load can run with the state settled.
+  const [savingReport, setSavingReport] = useState(false)
+  const [restoreToken, setRestoreToken] = useState(0)
+  const restoreRef   = useRef(null)
+  const autoLoadRef  = useRef(false)
+  const restoredRef  = useRef(false)   // guards the one-time mount restore
   // Multi-equipment classic pagination: { page, totalPages, total, pageSize }.
   const [mergedNav,   setMergedNav]   = useState(null)
   // Holds the request payload so page navigation can refetch (server-side paging).
@@ -708,6 +774,9 @@ export default function Reports() {
       setEqList([])
       setSelectedEqIds(new Set(meta.table_name ? [meta.table_name] : []))
       setLoadingEqList(false)
+      // Single-source equipment is fixed (the one table), so a restore just advances
+      // to its tag stage — the tags effect below applies the saved tag selection.
+      if (restoreRef.current) restoreRef.current.stage = 'tags'
       return
     }
 
@@ -721,7 +790,16 @@ export default function Reports() {
       .then(data => {
         const list = safeArr(data)
         setEqList(list)
-        setSelectedEqIds(new Set(presetEquipmentIds(eqType, list)))
+        // Restoring a saved report → reselect exactly the saved identifiers that
+        // still exist; otherwise fall back to the type's preset selection.
+        if (restoreRef.current && restoreRef.current.stage === 'eq') {
+          const wanted = (restoreRef.current.equipmentIds || [])
+            .filter(id => list.some(e => e.equipment_id === id))
+          setSelectedEqIds(new Set(wanted.length ? wanted : presetEquipmentIds(eqType, list)))
+          restoreRef.current.stage = 'tags'
+        } else {
+          setSelectedEqIds(new Set(presetEquipmentIds(eqType, list)))
+        }
       })
       .catch(() => setEqList([]))
       .finally(() => setLoadingEqList(false))
@@ -737,14 +815,21 @@ export default function Reports() {
       .then(data => {
         const tags = Array.isArray(data?.tags) ? data.tags : []
         setTagList(tags)
-        // Selecting equipment auto-selects EVERY tag it exposes — the union of all
-        // fully-available columns across the selected equipment, straight from the
-        // database schema (no hardcoded/default subset, no 4-tag cap). Runs only
-        // when the equipment set changes, so a user's manual edits within a fixed
-        // selection are preserved until they change equipment again.
-        setSelected(new Set(
-          tags.filter(t => t.available !== false).map(t => t.column_name)
-        ))
+        const available = tags.filter(t => t.available !== false).map(t => t.column_name)
+        // Restoring a saved report → reselect exactly the saved tags that are still
+        // available; otherwise auto-select EVERY available tag (the default behaviour:
+        // the union of all fully-available columns across the selected equipment,
+        // straight from the database schema — no hardcoded subset, no cap).
+        if (restoreRef.current && restoreRef.current.stage === 'tags') {
+          const savedTags = restoreRef.current.tags || []
+          const availSet  = new Set(available)
+          const wanted    = savedTags.filter(t => availSet.has(t))
+          setSelected(new Set(wanted.length ? wanted : available))
+          restoreRef.current = null
+          setRestoreToken(x => x + 1)   // cascade done → an auto-load may now run
+        } else {
+          setSelected(new Set(available))
+        }
       })
       .catch(() => setTagList([]))
       .finally(() => setLoadingTags(false))
@@ -758,6 +843,45 @@ export default function Reports() {
     setAgg(DEFAULT_AGG)
   }, [])
 
+  // ── Publish the chosen range so Analytics opens on the same dates ───────────
+  // Only the RANGE is shared, and only once the user actually changes it — the very
+  // first run is skipped so the page's built-in defaults never overwrite a range the
+  // user picked earlier (and never pre-empt the Analytics default when nothing has
+  // been chosen yet). Restoring a saved report also lands here, since that is equally
+  // a range the user selected. Nothing about the Reports UI or its own state changes.
+  //
+  // The publish is DEBOUNCED and the cleanup cancels any pending one, so a burst of
+  // edits — the date picker firing per completed segment, or changing From and then
+  // To — settles into a SINGLE publish carrying the final pair. Intermediate values
+  // are never shared, so Analytics can never load a half-finished range. The context
+  // setter additionally rejects anything incomplete or backwards (From > To), which
+  // is exactly the state that exists between updating one end and the other.
+  const publishedOnce = useRef(false)
+  useEffect(() => {
+    if (!publishedOnce.current) { publishedOnce.current = true; return }
+    const id = setTimeout(() => setReportDateRange(fromDate, toDate), RANGE_PUBLISH_MS)
+    return () => clearTimeout(id)
+  }, [fromDate, toDate, setReportDateRange])
+
+  // ── Time Interval options follow the selected date range ────────────────────
+  // One shared rule (utils/intervals.intervalsForRange) drives the dropdown for
+  // EVERY report/equipment type: a range of one month or less offers 1m/5m/15m/
+  // 30m/Hourly, a longer range offers only 30m/Hourly. Recomputed on every From/To
+  // change, so the list is always in step with the dates.
+  const availableIntervals = useMemo(
+    () => intervalsForRange(fromDate, toDate), [fromDate, toDate])
+
+  // If the range change made the current interval unavailable, move to a valid one
+  // (Hourly by preference) so the selector never keeps a hidden value. Aggregation is
+  // reset alongside it, exactly as a manual interval change does.
+  useEffect(() => {
+    setInterval(prev => {
+      const next = resolveInterval(prev, fromDate, toDate)
+      if (next !== prev) setAgg(DEFAULT_AGG)
+      return next
+    })
+  }, [fromDate, toDate])
+
   // ── Preconfigured report ──────────────────────────────────────────────────────
   // Picking a report type loads its preset: default Time Interval and Aggregation
   // here, default Equipment Identifier(s) in the equipment effect above, and every
@@ -770,6 +894,41 @@ export default function Reports() {
     setInterval(preset.interval)
     setAgg(preset.agg)
   }, [])
+
+  // ── Restore a saved (Preconfigured) report into the page ────────────────────
+  // Re-applies a stored configuration exactly. Interval/aggregation/dates are set
+  // directly (so they are NOT overwritten by the type preset), and the equipment +
+  // tag selections are handed to `restoreRef` so the equipment→tags load cascade
+  // reselects them instead of auto-selecting everything. Setting eqType last kicks
+  // the cascade off. `autoLoad` remembers a Run/Load request for after it settles.
+  const applyRestore = useCallback((cfg, autoLoad = false) => {
+    if (!cfg || !cfg.equipment_type) return
+    restoreRef.current = {
+      equipmentIds: Array.isArray(cfg.equipment_ids) ? cfg.equipment_ids : [],
+      tags:         Array.isArray(cfg.tags) ? cfg.tags : [],
+      stage:        'eq',
+    }
+    autoLoadRef.current = !!autoLoad
+    if (cfg.from_date)    setFromDate(cfg.from_date)
+    if (cfg.to_date)      setToDate(cfg.to_date)
+    if (cfg.interval)     setInterval(cfg.interval)
+    if (cfg.agg_function) setAgg(cfg.agg_function)
+    if (cfg.page_size)    setPageSize(cfg.page_size)
+    setResult(null); setError(null); setWarning(null)
+    setEqType(cfg.equipment_type)      // triggers the equipment→tags cascade
+  }, [])
+
+  // One-time restore when arriving from Preconfigured Reports (Open/Edit or Run).
+  // The navigation state is cleared afterwards so a refresh doesn't re-restore.
+  useEffect(() => {
+    if (restoredRef.current) return
+    const st = location.state
+    if (st && st.restore) {
+      restoredRef.current = true
+      applyRestore(st.restore, st.autoLoad)
+      window.history.replaceState({}, '')
+    }
+  }, [location.state, applyRestore])
 
   // Preset for the current type — drives the summary banner and the highlighted
   // (recommended) export button.
@@ -829,6 +988,65 @@ export default function Reports() {
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [eqType, selectedEqIds, selected, buildPayload, showToast])
+
+  // ── Save the current configuration as a Preconfigured report ─────────────────
+  // A default name for the Save prompt: report type + timestamp, so a user can
+  // accept it or type their own. This never affects report data or exports.
+  const defaultReportName = useCallback(() => {
+    const d = new Date()
+    const p = n => String(n).padStart(2, '0')
+    const stamp = `${p(d.getDate())}/${p(d.getMonth() + 1)}/${d.getFullYear()} ` +
+                  `${p(d.getHours())}:${p(d.getMinutes())}`
+    return `${eqType || 'Report'} · ${stamp}`
+  }, [eqType])
+
+  // Persist the whole configuration to the backend so it appears in Preconfigured
+  // Reports and survives a refresh/restart. Validates that a complete config AND
+  // loaded data exist first (client req 9) — the Save button is also disabled until
+  // then. Does NOT touch the report data, queries, calculations, or exports.
+  const handleSave = useCallback(async () => {
+    if (!eqType)                  return showToast('Select Equipment Type')
+    if (selectedEqIds.size === 0) return showToast('Select Equipment Identifier')
+    if (selected.size === 0)      return showToast('Select at least one tag')
+    if (!result)                  return showToast('Click Load Data and verify the report before saving')
+
+    const name = window.prompt('Save report as:', defaultReportName())
+    if (name === null) return                       // user cancelled
+    if (!name.trim())  return showToast('Report name is required')
+
+    setSavingReport(true)
+    try {
+      await createSavedReport({
+        name:           name.trim(),
+        equipment_type: eqType,
+        equipment_ids:  [...selectedEqIds].filter(id => id && String(id).trim()),
+        tags:           [...selected],
+        from_date:      fromDate,
+        to_date:        toDate,
+        interval,
+        agg_function:   agg,
+        page_size:      pageSize,
+      })
+      showToast('Report saved successfully.')
+    } catch (e) {
+      showToast(`Save failed: ${e.message}`)
+    } finally {
+      setSavingReport(false)
+    }
+  }, [eqType, selectedEqIds, selected, result, fromDate, toDate, interval, agg,
+      pageSize, defaultReportName, showToast])
+
+  // When a Preconfigured report was opened with Run/Load, auto-trigger Load Data
+  // once the equipment→tags restore cascade has finished (restoreToken bumps) and
+  // the selection is settled — exactly as if the user clicked Load Data themselves.
+  useEffect(() => {
+    if (restoreToken === 0) return
+    if (autoLoadRef.current && selected.size > 0 && selectedEqIds.size > 0) {
+      autoLoadRef.current = false
+      handleLoadData()
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [restoreToken])
 
   // ── Multi-equipment load — classic server-side pagination ────────────────────
   // The first page runs as a background job so per-equipment count preparation can
@@ -966,7 +1184,7 @@ export default function Reports() {
         ? `All_${eqType}_Equipment`
         : selectedEqIds.size > 1
           ? `${selectedEqIds.size}_Equipment`
-          : trackerDisplayName(primaryEqId)   // Tracker{n} for the merged type; unchanged otherwise
+          : trackerDisplayName(primaryEqId)   // IS{nn} for the merged type; unchanged otherwise
       const filename = `${filePrefix}_Report_${todayDMY()}.${ext}`
       // Anchor MUST be in the DOM and the blob URL must NOT be revoked synchronously —
       // revoking too early aborts the download in most browsers.
@@ -1162,18 +1380,16 @@ export default function Reports() {
 
   const handleExportCSV   = () => handleDownload(exportReportCSVV2,   'csv',  10000, 'CSV')
   const handleExportExcel = () => {
-    // Export routing (no data preload required — all stream from the backend):
-    //  · Tracker (T1/T2 Isolation) → direct-to-Downloads: each device report is built
-    //                                in parallel and saved into a single timestamped
-    //                                folder (Downloads\Tracker_Reports_<ts>\Tracker{n}.xlsx)
-    //  · String Combiner           → direct-to-Downloads: one INV{n}.xlsx per inverter,
-    //                                all inside Downloads\SMB_Reports_<ts>\ (NO ZIP)
-    //  · any multi-equipment select → async job (one worksheet per equipment)
-    // Single-equipment (1 sheet) stays synchronous.
-    if (isTrackerType(eqType) && selectedEqIds.size > 0) return runToDownloadsExport()
-    if (eqType === 'String Combiner' && selectedEqIds.size > 0) return runToDownloadsExport()
-    if (selectedEqIds.size > 1)                              return runAsyncExport()
-    return handleDownload(exportReportExcelV2, 'xlsx', 10000, 'Excel')
+    // EVERY equipment type is saved on disk under the single Reports root, in its own
+    // per-type subfolder (Downloads\Reports\<Equipment Type>\…), via the to-Downloads
+    // flow (background job + SSE progress + saved-location toast):
+    //  · Tracker (T1/T2 Isolation) → Reports\Tracker\IS01.xlsx … (one file per device)
+    //  · String Combiner           → Reports\String Combiner\INV{n}.xlsx (one per inverter)
+    //  · every other type          → Reports\<type>\<name>_Report_<date>.xlsx (one workbook,
+    //                                one worksheet per equipment) — same bytes the browser
+    //                                export produced; only the destination changed.
+    if (selectedEqIds.size > 0) return runToDownloadsExport()
+    return showToast('Select equipment first')
   }
 
   // ── Column metadata from tag registry ────────────────────────────────────────
@@ -1188,20 +1404,16 @@ export default function Reports() {
   // table, so nothing is truncated on the frontend and the DOM stays tiny. The
   // backend bounds the preview per-equipment (all devices present) so the export
   // still holds the complete data.
+  // Column ORDER is decided by the backend and rendered here verbatim — this table
+  // never re-sorts it. For Tracker the API orders columns through
+  // `isolator_columns.order_columns_by_id`, the SAME function the Excel export uses,
+  // so the on-screen sequence (Timestamp → every tag of Id1 → every tag of Id2 → …)
+  // is identical to the generated worksheet. The frontend used to re-sort Tracker
+  // columns metric-first here (all Alarm, then all Battery Level, …), which both
+  // contradicted the workbook and duplicated ordering logic; that sort is gone.
   const tableCols = useMemo(() => {
     if (!result?.columns) return []
-    let columns = result.columns
-    // For T1/T2 Isolation, reorder the TAG columns to the ID-grouped order that the
-    // Excel export uses, so the grid and the workbook are identical. Timestamp (and
-    // the merged-view Equipment column) keep their leading positions; only the tag
-    // columns are regrouped. Data cells follow automatically (they are keyed by
-    // column name), so sorting/filtering/pagination/virtualization are unaffected.
-    if (isTrackerType(eqType)) {
-      const lead = columns.filter(c => c === '_equipment' || c === 'timestamp')
-      const tags = columns.filter(c => c !== '_equipment' && c !== 'timestamp')
-      columns = [...lead, ...orderIsolationColumns(tags)]
-    }
-    return columns.map(col => {
+    return result.columns.map(col => {
       if (col === '_equipment') return { key: col, label: 'Equipment', isTs: false }
       if (col === 'timestamp')  return { key: col, label: 'Timestamp (DD/MM/YYYY HH:MM:SS)', isTs: true }
       const meta = tagLookup[col]
@@ -1255,26 +1467,6 @@ export default function Reports() {
       <div className="card mb-3">
         <div className="card-title">Equipment Selection</div>
 
-        {/* Preconfigured report — shows the defaults that were applied for the
-            selected report type. Every one of them stays editable below. */}
-        {activePreset && (
-          <div className="mb-2.5 flex flex-wrap items-center gap-x-2 gap-y-1 rounded-md
-                          border border-ge-accent/30 bg-ge-accent/5 px-2.5 py-1.5 text-[11px]">
-            <span className="text-ge-accent">⚡</span>
-            <span className="text-ge-text2">
-              Preconfigured <span className="text-ge-text1 font-medium">{eqType}</span> report
-            </span>
-            <span className="font-mono text-ge-text3">
-              {INTERVAL_LABELS[activePreset.interval] || activePreset.interval}
-              {showsAggregation(activePreset.interval) ? ` · ${activePreset.agg.toUpperCase()}` : ''}
-              {` · ${activePreset.format} · all tags`}
-            </span>
-            <span className="ml-auto text-[10px] uppercase tracking-widest text-ge-text3">
-              Defaults — editable
-            </span>
-          </div>
-        )}
-
         <FormRow>
           <FormGroup label="Equipment Type">
             {loadingTypes ? (
@@ -1287,7 +1479,7 @@ export default function Reports() {
                 <option value="">— Select Type —</option>
                 {eqTypes.map(t => (
                   <option key={t.equipment_type} value={t.equipment_type}>
-                    {t.equipment_type}
+                    {eqTypeLabel(t.equipment_type)}
                   </option>
                 ))}
               </select>
@@ -1365,16 +1557,16 @@ export default function Reports() {
         )}
       </div>
 
-      {/* Tag Selection — READ-ONLY. Every available tag is auto-selected and shown
-          in both lists exactly as before; all interactions are disabled so the user
-          can view but not modify the selection. */}
+      {/* Tag Selection — interactive. Every available tag is auto-selected when the
+          equipment changes, so the panel opens fully selected; Select All / Clear All,
+          search and per-tag toggling let the user refine it. */}
       <div className="card mb-3">
         {loadingTags ? (
           <div className="flex items-center gap-2 py-6 text-ge-text3 text-[12px]">
             <Spinner size={14} /> Loading tags from database...
           </div>
         ) : tagList.length > 0 ? (
-          <DynamicTagSelector tags={tagList} selected={selected} />
+          <DynamicTagSelector tags={tagList} selected={selected} setSelected={setSelected} />
         ) : eqType ? (
           <div className="text-[12px] text-ge-text3 py-4 text-center">
             {selectedEqIds.size > 0 ? 'No tags found' : 'Select Equipment Identifier to load tags'}
@@ -1404,7 +1596,9 @@ export default function Reports() {
           <FormGroup label="Time Interval">
             <select className="form-control" value={interval}
               onChange={e => changeInterval(e.target.value)}>
-              {INTERVALS.map(v => (
+              {/* Options come from the shared From→To rule, so every report/equipment
+                  type on this page offers exactly the same set for a given range. */}
+              {availableIntervals.map(v => (
                 <option key={v} value={v}>{INTERVAL_LABELS[v]}</option>
               ))}
             </select>
@@ -1442,6 +1636,20 @@ export default function Reports() {
           </button>
 
           <ExportBtn onClick={handleExportCSV}   icon="📊" label="CSV"   />
+
+          {/* Save the current configuration as a Preconfigured report. Enabled only
+              after Load Data succeeds (a config + verified data must exist), so it
+              validates before saving. Independent of Export Excel, which is untouched. */}
+          <button className="btn btn-outline btn-sm" onClick={handleSave}
+            disabled={savingReport || !canExport || !result}
+            title={result
+              ? 'Save this report configuration to Preconfigured Reports'
+              : 'Load Data first, then Save'}>
+            {savingReport
+              ? <><Spinner size={12} /> Saving...</>
+              : <>💾 Save</>}
+          </button>
+
           <ExportBtn onClick={handleExportExcel} icon="📗" label="Excel" />
 
           {result && (

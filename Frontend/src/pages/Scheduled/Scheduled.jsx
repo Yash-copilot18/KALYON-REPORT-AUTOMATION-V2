@@ -4,6 +4,7 @@ import { PageHeader, Spinner } from '../../components/Common'
 import { useApp } from '../../utils/AppContext'
 import {
   fetchScheduledEmailConfig, sendTestEmail, fetchReportEquipmentList,
+  fetchReportEquipmentTypes,
   fetchSchedules, createSchedule, updateSchedule, deleteSchedule,
   runSchedule, pauseSchedule, resumeSchedule, fetchScheduleRuns,
 } from '../../services/api'
@@ -38,18 +39,119 @@ function nextRun(freq) {
 }
 
 // ── Schedule Form ──────────────────────────────────────────────────────────────
-// Scheduled Reports supports ONLY these three generation reports (client rule).
-// `value` is the backend equipment_type; `label` is what the user sees.
-const SCHEDULED_REPORT_TYPES = [
-  { value: 'Daily Generation',   label: 'Daily Generation Report (DGR)' },
-  { value: 'Monthly Generation', label: 'Monthly Generation Report (MGR)' },
-  { value: 'Yearly Generation',  label: 'Yearly Generation Report (YGR)' },
-]
+// The Report Type dropdown shows every equipment/report type the application supports
+// (loaded dynamically from the same /equipment-types API the Reports page uses) AND
+// the three generation reports (DGR / MGR / YGR), which are appended at the end. All
+// remain fully schedulable — the backend generates each through its own logic.
+//
+// The three generation report types, in the order they appear at the end of the
+// dropdown. "Yearly Generation" is not an equipment table, so it is not returned by
+// the equipment-types API and is added here explicitly.
+const GENERATION_TYPES = ['Daily Generation', 'Monthly Generation', 'Yearly Generation']
+
+// Friendly display labels for the generation reports (equipment types show their own
+// name). Used in both the dropdown and the schedule table.
+const REPORT_TYPE_LABELS = {
+  'Daily Generation':   'DGR — Daily Generation Report',
+  'Monthly Generation': 'MGR — Monthly Generation Report',
+  'Yearly Generation':  'YGR — Yearly Generation Report',
+}
 const YGR_TYPE = 'Yearly Generation'          // plant-level: has no equipment identifier
 const DEFAULT_TIME = '20:30'                   // default scheduled execution time (8:30 PM)
 
-const typeLabel = (v) =>
-  (SCHEDULED_REPORT_TYPES.find(t => t.value === v)?.label) || v
+const typeLabel = (v) => REPORT_TYPE_LABELS[v] || v
+
+// ── Recipients ────────────────────────────────────────────────────────────────
+// Same address rule the backend enforces (email_service.EMAIL_RE), so the UI never
+// accepts something the API would reject.
+const EMAIL_RE = /^[^\s@,;]+@[^\s@,;]+\.[A-Za-z]{2,}$/
+const isEmail = v => EMAIL_RE.test((v || '').trim())
+
+// The stored form is a comma-separated string — the shape the `recipients` column has
+// always used — so these two helpers are the only place the list/string conversion
+// happens and the API payload is unchanged.
+const splitRecipients = v =>
+  String(v || '').split(/[,;\s]+/).map(s => s.trim()).filter(Boolean)
+const joinRecipients = list => list.join(', ')
+
+// Multi-email input: each valid address becomes a removable chip. Enter, comma and
+// semicolon commit the address; paste splits on commas/semicolons/whitespace so a
+// whole list can be pasted at once; Backspace on an empty box removes the last chip.
+// Duplicates (case-insensitive) and malformed addresses are refused with a message.
+function RecipientsInput({ value, onChange, fallback }) {
+  const [draft, setDraft] = useState('')
+  const [error, setError] = useState('')
+  const list = useMemo(() => splitRecipients(value), [value])
+
+  // Add every address in `raw`; reports the first problem it hits but still adds the
+  // good ones, so pasting a mixed list doesn't lose the valid addresses.
+  const add = raw => {
+    const candidates = splitRecipients(raw)
+    if (!candidates.length) return true
+    const next = [...list]
+    const seen = new Set(next.map(e => e.toLowerCase()))
+    let msg = ''
+    for (const c of candidates) {
+      if (!isEmail(c)) { msg = msg || `"${c}" is not a valid email address`; continue }
+      if (seen.has(c.toLowerCase())) { msg = msg || `"${c}" is already added`; continue }
+      seen.add(c.toLowerCase()); next.push(c)
+    }
+    onChange(joinRecipients(next))
+    setError(msg)
+    return !msg
+  }
+
+  const remove = idx => {
+    onChange(joinRecipients(list.filter((_, i) => i !== idx)))
+    setError('')
+  }
+
+  const onKeyDown = e => {
+    if (e.key === 'Enter' || e.key === ',' || e.key === ';') {
+      e.preventDefault()                       // never submits the form
+      if (draft.trim() && add(draft)) setDraft('')
+    } else if (e.key === 'Backspace' && !draft && list.length) {
+      remove(list.length - 1)
+    }
+  }
+
+  const onPaste = e => {
+    const text = e.clipboardData.getData('text')
+    if (!/[,;\s]/.test(text)) return            // a single address types normally
+    e.preventDefault()
+    if (add(text)) setDraft('')
+  }
+
+  return (
+    <div className="flex flex-col gap-1">
+      <label className="form-label">Recipients *</label>
+      <div className="form-control flex flex-wrap items-center gap-1.5 min-h-[38px] py-1.5">
+        {list.map((email, i) => (
+          <span key={`${email}-${i}`}
+            className="inline-flex items-center gap-1 rounded bg-ge-blue/20 border border-ge-blue/40
+                       text-ge-text1 font-mono text-[11px] pl-2 pr-1 py-0.5">
+            {email}
+            <button type="button" onClick={() => remove(i)} aria-label={`Remove ${email}`}
+              className="text-ge-text3 hover:text-ge-danger leading-none px-0.5">×</button>
+          </span>
+        ))}
+        <input
+          type="text" value={draft}
+          onChange={e => { setDraft(e.target.value); if (error) setError('') }}
+          onKeyDown={onKeyDown} onPaste={onPaste}
+          onBlur={() => { if (draft.trim() && add(draft)) setDraft('') }}
+          placeholder={list.length ? 'Add another…' : (fallback || 'name@example.com')}
+          className="flex-1 min-w-[150px] bg-transparent border-0 outline-none text-ge-text1
+                     text-[12px] font-sans placeholder:text-ge-text3" />
+      </div>
+      {error
+        ? <span className="text-[10px] text-ge-danger">{error}</span>
+        : <span className="text-[10px] text-ge-text3">
+            Press Enter, comma or semicolon to add. The report is e-mailed to every recipient.
+          </span>}
+    </div>
+  )
+}
 
 function ScheduleForm({ initial, onSave, onCancel, recipient }) {
   const [form, setForm] = useState(
@@ -59,6 +161,9 @@ function ScheduleForm({ initial, onSave, onCancel, recipient }) {
           eq_type:'', eq_id:'', from:todayStr(), to:todayStr(),
           interval:'hourly', agg:DEFAULT_AGG, format:'Excel', freq:'Daily',
           time: DEFAULT_TIME,
+          // A new schedule starts with the backend's configured address so the
+          // default behaviour is unchanged; it can be removed or added to.
+          recipients: recipient || '',
         }
   )
 
@@ -67,7 +172,30 @@ function ScheduleForm({ initial, onSave, onCancel, recipient }) {
   const [eqList,    setEqList]    = useState([])
   const [loadingEq, setLoadingEq] = useState(false)
 
+  // Supported report types — every equipment/report type from the app's equipment-types
+  // API (in its natural order), followed by the three generation reports (DGR/MGR/YGR)
+  // appended at the end. Never a hardcoded equipment list.
+  const [reportTypes, setReportTypes] = useState(GENERATION_TYPES)
+  useEffect(() => {
+    let cancelled = false
+    fetchReportEquipmentTypes()
+      .then(data => {
+        const list = Array.isArray(data) ? data : (data?.items || data?.data || [])
+        // Equipment types first, minus any generation types the API also returns
+        // (Daily/Monthly Generation) so they aren't duplicated when appended below.
+        const equip = list
+          .map(t => t.equipment_type)
+          .filter(t => t && !GENERATION_TYPES.includes(t))
+        if (!cancelled) setReportTypes([...equip, ...GENERATION_TYPES])
+      })
+      .catch(() => { if (!cancelled) setReportTypes([...GENERATION_TYPES]) })
+    return () => { cancelled = true }
+  }, [])
+
   const set = (k, v) => setForm(f => ({ ...f, [k]: v }))
+  // Set two keys to the same value in one update — used so the single Report Date
+  // populates both from/to (scheduled reports use a single date, no range).
+  const set2 = (k1, k2, v) => setForm(f => ({ ...f, [k1]: v, [k2]: v }))
 
   // Changing interval restores the default aggregation, so returning from an
   // instant interval shows the dropdown back on "Average".
@@ -117,7 +245,13 @@ function ScheduleForm({ initial, onSave, onCancel, recipient }) {
   const handleSubmit = e => {
     e.preventDefault()
     if (!form.eq_type.trim())  return alert('Report type required')
-    onSave(form)
+    // Every chip must be a valid address and there must be at least one, so the
+    // schedule can never be saved with nobody (or a typo) to send to.
+    const emails = splitRecipients(form.recipients)
+    if (!emails.length)          return alert('At least one recipient email is required')
+    const bad = emails.filter(v => !isEmail(v))
+    if (bad.length)              return alert(`Invalid email address: ${bad.join(', ')}`)
+    onSave({ ...form, recipients: joinRecipients(emails) })
   }
 
   return (
@@ -128,8 +262,13 @@ function ScheduleForm({ initial, onSave, onCancel, recipient }) {
           <select className="form-control" value={form.eq_type}
             onChange={e => changeType(e.target.value)}>
             <option value="">— Select —</option>
-            {SCHEDULED_REPORT_TYPES.map(t => (
-              <option key={t.value} value={t.value}>{t.label}</option>
+            {/* Show the currently-selected type even if it isn't in the dynamic list
+                (e.g. editing an older DGR/MGR/YGR schedule) so its value is preserved. */}
+            {form.eq_type && !reportTypes.includes(form.eq_type) && (
+              <option value={form.eq_type}>{typeLabel(form.eq_type)}</option>
+            )}
+            {reportTypes.map(t => (
+              <option key={t} value={t}>{typeLabel(t)}</option>
             ))}
           </select>
         </div>
@@ -174,16 +313,19 @@ function ScheduleForm({ initial, onSave, onCancel, recipient }) {
         </div>
       )}
 
+      {/* Scheduled reports use a SINGLE date (client requirement) — no To Date / date
+          range. The one Report Date is written to BOTH from/to in the payload so the
+          backend report-generation logic (which derives the report's day/month/year
+          from the schedule's date) is unchanged. */}
       <div className="grid grid-cols-2 gap-3">
         <div className="flex flex-col gap-1">
-          <label className="form-label">From Date</label>
-          <input type="date" className="form-control" value={form.from}
-            onChange={e => set('from', e.target.value)} />
-        </div>
-        <div className="flex flex-col gap-1">
-          <label className="form-label">To Date</label>
-          <input type="date" className="form-control" value={form.to}
-            onChange={e => set('to', e.target.value)} />
+          <label className="form-label">Report Date *</label>
+          <input type="date" className="form-control"
+            value={form.to || form.from || todayStr()}
+            onChange={e => set2('from', 'to', e.target.value)} />
+          <span className="text-[10px] text-ge-text3">
+            The single date the scheduled report is generated for.
+          </span>
         </div>
       </div>
 
@@ -239,19 +381,12 @@ function ScheduleForm({ initial, onSave, onCancel, recipient }) {
         </div>
       </div>
 
-      {/* Recipient dropdown removed for the testing phase — reports are e-mailed to
-          a single recipient configured in the backend (.env). Multi-recipient
-          support with a searchable dropdown comes in a later phase. */}
-      <div className="flex flex-col gap-1">
-        <label className="form-label">Recipient</label>
-        <div className="form-control flex items-center gap-2 text-ge-text2 text-[12px] bg-ge-elevated">
-          <span>📧</span>
-          <span className="font-mono">{recipient || 'Configured in backend (.env)'}</span>
-          <span className="ml-auto text-[10px] text-ge-text3 uppercase tracking-wider">
-            Fixed (testing)
-          </span>
-        </div>
-      </div>
+      {/* Recipients — one chip per address; the report is e-mailed to all of them.
+          Stored on the schedule in the existing comma-separated `recipients` column. */}
+      <RecipientsInput
+        value={form.recipients}
+        onChange={v => set('recipients', v)}
+        fallback={recipient} />
 
       <div className="flex gap-2 pt-2 justify-end">
         <button type="button" className="btn btn-outline btn-sm" onClick={onCancel}>

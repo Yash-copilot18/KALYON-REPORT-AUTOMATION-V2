@@ -17,7 +17,7 @@ export default function Header() {
       {/* Title */}
       <div className="flex-1 min-w-0">
         <h1 className="text-[13px] font-semibold text-ge-text1 leading-tight">
-          KALYON NIGDE 130 MW &mdash; REPORT AUTOMATION
+          KALYON NIGDE 130 MW
         </h1>
       </div>
 

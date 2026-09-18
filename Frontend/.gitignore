@@ -1,0 +1,19 @@
+# Dependencies — reinstall from package.json + package-lock.json
+node_modules/
+
+# Build output
+dist/
+dist-ssr/
+.vite/
+
+# Local environment (VITE_* values are build-time and public, but keep local overrides
+# out of the repo). The committed template is .env.example.
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*

@@ -7,16 +7,53 @@ hardcoded. The single test recipient defaults to REPORT_RECIPIENT_EMAIL.
 """
 
 import os
+import re
 import ssl
 import smtplib
 import logging
 from email.message import EmailMessage
+from typing import Iterable, List, Sequence, Union
 
 logger = logging.getLogger(__name__)
 
-# Single pre-configured recipient for the current testing phase. Overridable via
-# the REPORT_RECIPIENT_EMAIL environment variable. Multi-recipient support comes later.
+# Fallback destination used when a schedule carries no recipients of its own.
+# Overridable via the REPORT_RECIPIENT_EMAIL environment variable.
 DEFAULT_RECIPIENT_EMAIL = "ptshivaji8@gmail.com"
+
+# Pragmatic address check — one @, no spaces or separators, a dotted domain. Shared
+# with the API/UI validation so all three agree on what a valid address looks like.
+EMAIL_RE = re.compile(r"^[^\s@,;]+@[^\s@,;]+\.[A-Za-z]{2,}$")
+
+
+def is_valid_email(address: str) -> bool:
+    return bool(EMAIL_RE.match((address or "").strip()))
+
+
+def parse_recipients(value: Union[str, Sequence[str], None]) -> List[str]:
+    """
+    Normalise recipients from either storage form into an ordered, de-duplicated
+    list: a comma/semicolon-separated string (how the column has always been
+    stored) OR a list of addresses (what the API now also accepts).
+
+    De-duplication is case-insensitive but the address is kept as typed. Order is
+    preserved, so the first address stays first. No validation here — callers that
+    need it use `is_valid_email` so they can report WHICH address was bad.
+    """
+    if value is None:
+        parts: Iterable = ()
+    elif isinstance(value, str):
+        parts = re.split(r"[,;]", value)
+    else:
+        parts = value
+    out: List[str] = []
+    seen = set()
+    for part in parts:
+        addr = str(part or "").strip()
+        key = addr.lower()
+        if addr and key not in seen:
+            seen.add(key)
+            out.append(addr)
+    return out
 
 
 def get_recipient_email() -> str:
@@ -69,7 +106,7 @@ def log_startup_status() -> bool:
 
 
 def send_email_with_attachment(
-    to_email: str,
+    to_email: Union[str, Sequence[str]],
     subject: str,
     body: str,
     attachment_bytes: bytes | None = None,
@@ -79,6 +116,11 @@ def send_email_with_attachment(
 ) -> dict:
     """
     Send an e-mail with an optional file attachment.
+
+    `to_email` accepts a single address, a comma/semicolon-separated string, or a
+    list of addresses. EVERY address is put in the To header (this system has no
+    CC/BCC concept), and smtplib delivers one message to all of them, so a
+    multi-recipient schedule sends exactly one report to everybody at once.
 
     Returns a structured result: {"success": bool, "error": str | None}.
     Never raises — failures are logged and returned so callers can report status.
@@ -91,9 +133,15 @@ def send_email_with_attachment(
         logger.error("Email send aborted -> %s", err)
         return {"success": False, "error": err}
 
+    recipients = parse_recipients(to_email)
+    if not recipients:
+        err = "No recipient address supplied."
+        logger.error("Email send aborted -> %s", err)
+        return {"success": False, "error": err}
+
     msg = EmailMessage()
     msg["From"] = cfg["from_email"] or cfg["username"]
-    msg["To"] = to_email
+    msg["To"] = ", ".join(recipients)
     msg["Subject"] = subject
     msg.set_content(body)
 
@@ -106,8 +154,9 @@ def send_email_with_attachment(
         )
 
     logger.info(
-        "Email send requested -> recipient=%s | subject=%s | attachment=%s | host=%s:%s",
-        to_email, subject, attachment_filename or "none", cfg["host"], cfg["port"],
+        "Email send requested -> recipients=%d %s | subject=%s | attachment=%s | host=%s:%s",
+        len(recipients), recipients, subject, attachment_filename or "none",
+        cfg["host"], cfg["port"],
     )
 
     try:
@@ -129,15 +178,15 @@ def send_email_with_attachment(
                 server.send_message(msg)
 
         logger.info(
-            "Email status -> SUCCESS | recipient=%s | subject=%s | attachment=%s",
-            to_email, subject, attachment_filename or "none",
+            "Email status -> SUCCESS | recipients=%s | subject=%s | attachment=%s",
+            recipients, subject, attachment_filename or "none",
         )
         return {"success": True, "error": None}
 
     except Exception as e:  # noqa: BLE001 — report any SMTP/network failure to caller
         err = f"{type(e).__name__}: {e}"
         logger.error(
-            "Email status -> FAILED | recipient=%s | subject=%s | attachment=%s | error=%s",
-            to_email, subject, attachment_filename or "none", err, exc_info=True,
+            "Email status -> FAILED | recipients=%s | subject=%s | attachment=%s | error=%s",
+            recipients, subject, attachment_filename or "none", err, exc_info=True,
         )
         return {"success": False, "error": err}

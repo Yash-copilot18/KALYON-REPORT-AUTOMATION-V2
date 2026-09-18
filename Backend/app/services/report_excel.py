@@ -23,6 +23,7 @@ auto-fit columns, DD/MM/YYYY HH:MM:SS timestamps, 3-decimal numbers.
 """
 
 import io
+import os
 import time
 import logging
 from datetime import datetime
@@ -38,7 +39,7 @@ from app.services import intervals
 logger = logging.getLogger(__name__)
 
 XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-COMPANY_TITLE = "Kalyon Solar Monitoring — Report Automation"
+COMPANY_TITLE = "Kalyon Solar Monitoring"
 
 _MAX_ROWS      = 10_000     # per-sheet row cap (bounds memory / matches preview export)
 _FETCH_WORKERS = 5          # concurrent equipment fetches
@@ -107,7 +108,9 @@ def make_formats(wb) -> Dict:
         return wb.add_format(d)
 
     return {
-        # Report title — bold 16pt black, left-aligned, no fill (white sheet).
+        # Report title — bold 16pt black, LEFT-aligned at the top-left (Column A), no fill.
+        # Left-aligned so it always starts at A1 and never drifts toward the middle/right no
+        # matter how many columns the report has.
         "title": wb.add_format({"font_name": "Calibri", "font_size": 16, "bold": True,
                                 "font_color": BLACK, "align": "left", "valign": "vcenter"}),
         "subtitle": wb.add_format({"font_name": "Calibri", "font_size": 11, "bold": True,
@@ -166,6 +169,17 @@ def safe_sheet_name(name: str, used: set) -> str:
     return s
 
 
+def _meta_upper(v) -> str:
+    """
+    Metadata VALUES are shown upper-cased (e.g. Inverter → INVERTER, Daily → DAILY,
+    Average → AVERAGE). This is a display transform only: dates ("07/02/2024") and the
+    Equipment ID ("INVERTER_01") contain no lower-case letters, so upper-casing leaves
+    them byte-for-byte unchanged — no date/number/ID format is altered. Labels are NOT
+    passed through here, so field names keep their exact mixed case.
+    """
+    return str(v).upper()
+
+
 def _meta_fields(header: dict):
     """
     Ordered (label, value) metadata pairs shared by both sheet renderers.
@@ -173,18 +187,19 @@ def _meta_fields(header: dict):
     A caller may override the exact rows by putting a `meta_fields` list of
     (label, value) tuples on the header (e.g. to drop the Aggregation row for a
     specific report); when absent, the default six-row block is used, so every
-    existing caller is unaffected.
+    existing caller is unaffected. Values are upper-cased via `_meta_upper` in both
+    branches so every export (default block and custom overrides) is consistent.
     """
     custom = header.get("meta_fields")
     if custom is not None:
-        return list(custom)
+        return [(k, _meta_upper(v)) for (k, v) in custom]
     return [
-        ("Equipment Type", header.get("equipment_type", "")),
-        ("Equipment ID",   header.get("equipment_id", "")),
-        ("From",           header.get("from", "")),
-        ("To",             header.get("to", "")),
-        ("Interval",       header.get("interval", "")),
-        ("Aggregation",    header.get("agg", "")),
+        ("Equipment Type", _meta_upper(header.get("equipment_type", ""))),
+        ("Equipment ID",   _meta_upper(header.get("equipment_id", ""))),
+        ("From",           _meta_upper(header.get("from", ""))),
+        ("To",             _meta_upper(header.get("to", ""))),
+        ("Interval",       _meta_upper(header.get("interval", ""))),
+        ("Aggregation",    _meta_upper(header.get("agg", ""))),
     ]
 
 
@@ -208,6 +223,19 @@ def _apply_wide_print_layout(ws, hdr_row: int, last_row: int, last_col: int,
     ws.repeat_columns(0, 0)              # timestamp column on every page across
     ws.set_footer(f"&L&\"Calibri,Regular\"&8{sheet_name}"
                   f"&R&\"Calibri,Regular\"&8Page &P of &N")
+
+
+def _write_report_title(ws, fmt, last_col: int) -> None:
+    """Write the company report title at A1, LEFT-aligned at the top-left of the sheet.
+
+    The title is a plain A1 write (NOT merged and NOT centered): left-aligned text simply
+    overflows the empty cells to its right, so "Kalyon Solar Monitoring"
+    always starts at Column A and never drifts toward the middle/right, regardless of how many
+    columns the report has. Applied via this one helper so every current/future sheet matches.
+    (`last_col` is accepted for a uniform call signature; the left-aligned title needs no span.)
+    """
+    ws.write(0, 0, COMPANY_TITLE, fmt["title"])
+    ws.set_row(0, 24)
 
 
 def write_report_sheet(wb, fmt, sheet_name: str, header: dict,
@@ -243,10 +271,12 @@ def write_report_sheet(wb, fmt, sheet_name: str, header: dict,
     for ci, w in enumerate(widths):
         ws.set_column(ci, ci, w)
 
-    # Row 0 — report title · Row 1 — subtitle. Written to column A (no merged
-    # cells); left-aligned text simply overflows the empty cells beside it.
-    ws.write(0, 0, COMPANY_TITLE, fmt["title"]); ws.set_row(0, 24)
-    ws.write(1, 0, header.get("subtitle", ""), fmt["subtitle"]); ws.set_row(1, 18)
+    # Row 0 — report title (the ONLY title line). Row 1 is left as an EMPTY spacer:
+    # the equipment name is not repeated here — it appears only in the metadata block
+    # below (Tracker Name / Equipment ID / …). Row positions are unchanged so the
+    # metadata, header and data rows keep their places and styling.
+    _write_report_title(ws, fmt, last_col)
+    ws.set_row(1, 18)
 
     # Rows 3–8 — metadata as label | value pairs, left-aligned, no merged cells.
     for i, (k, v) in enumerate(_meta_fields(header)):
@@ -323,9 +353,11 @@ def write_report_sheet_streaming(wb, fmt, sheet_name: str, header: dict,
     # Width seed = the header label (same as the batch renderer's starting point).
     widths = [max((len(x) for x in label_fn(col).split()), default=8) + 2 for col in columns]
 
-    # Report header block — identical rows/heights to write_report_sheet.
-    ws.write(0, 0, COMPANY_TITLE, fmt["title"]); ws.set_row(0, 24)
-    ws.write(1, 0, header.get("subtitle", ""), fmt["subtitle"]); ws.set_row(1, 18)
+    # Report header block — identical rows/heights to write_report_sheet. Row 0 is the
+    # ONLY title line; row 1 is an EMPTY spacer (the equipment name is not repeated here
+    # — it appears only in the metadata block below).
+    _write_report_title(ws, fmt, last_col)
+    ws.set_row(1, 18)
     for i, (k, v) in enumerate(_meta_fields(header)):
         r = 3 + i
         ws.write(r, 0, k, fmt["meta_lbl"])
@@ -556,7 +588,7 @@ def write_sectioned_sheet(wb, fmt, sheet_name: str, header: dict,
     # deliberately not written. Row 1 is left empty rather than shifting the block
     # up, so the metadata rows, the print-titles range and the section start row all
     # keep their positions.
-    ws.write(0, 0, COMPANY_TITLE, fmt["title"]); ws.set_row(0, 24)
+    _write_report_title(ws, fmt, last_col)
 
     for i, (k, v) in enumerate(_meta_fields(header)):
         r = 3 + i
@@ -814,6 +846,40 @@ def build_multi_equipment_workbook(req, equipment_ids, progress: Optional[Callab
     if progress:
         progress(100, f"Workbook ready — {total} sheet(s).")
     return data, filename
+
+
+def export_generic_to_downloads(req, equipment_ids, progress: Optional[Callable] = None) -> dict:
+    """
+    Build the standard one-worksheet-per-equipment workbook and SAVE it under the single
+    "Reports" root, in this equipment type's own subfolder:
+
+        Reports\\<Equipment Type>\\<filename>.xlsx
+
+    Used for EVERY equipment type that is not Tracker / String Combiner (those have their
+    own per-device folder writers). The workbook bytes, worksheets, headers, filters,
+    formatting, data and FILENAME are byte-for-byte identical to the browser export
+    (`build_multi_equipment_workbook`) — ONLY the destination changes: instead of
+    streaming to the browser, the file is written into Reports\\<type>\\ (created on
+    demand). Returns a summary dict shaped like the other to-Downloads exports so the
+    router/SSE/toast handle it uniformly.
+    """
+    from app.services.downloads import resolve_reports_dir, verify_files_written
+
+    ids = list(equipment_ids or [req.equipment_id])
+    data, filename = build_multi_equipment_workbook(req, ids, progress)
+
+    target_dir = resolve_reports_dir(req.equipment_type)   # Reports\<type>\ (auto-created)
+    path = os.path.join(target_dir, filename)
+    with open(path, "wb") as fh:
+        fh.write(data)
+    verify_files_written([path])
+
+    logger.info("Generic export SAVED -> %s (%d bytes)", path, len(data))
+    if progress:
+        progress(100, f"Saved report to {target_dir}")
+    return {"directory": target_dir, "path": target_dir,
+            "folder_name": os.path.basename(target_dir), "saved": [filename],
+            "count": 1, "sheets": len(ids)}
 
 
 def _d(dt) -> str:

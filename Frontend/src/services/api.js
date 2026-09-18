@@ -68,12 +68,21 @@ export const deleteEquipment        = (id)       => api.delete(`/api/v1/equipmen
 // ── Analytics ──────────────────────────────────────────────────────────────
 // Consolidated analytics dashboard: KPIs + trends + per-inverter ranking for a
 // date range, all from real telemetry. Omitted dates default to the latest 30 days.
-export const fetchAnalyticsOverview = ({ from, to, equipment } = {}) =>
+// `equipmentType` (Inverter/WMS/PPC) is forwarded for the equipment-type selector; the
+// current endpoint ignores unknown params, so this is a no-op server-side until the
+// backend adds per-type analytics — it never breaks the existing request.
+export const fetchAnalyticsOverview = ({ from, to, equipment, equipmentIds, equipmentType } = {}) =>
   api.get('/api/v1/analytics/overview', {
     params: {
       ...(from ? { from_date: from } : {}),
       ...(to ? { to_date: to } : {}),
-      ...(equipment && equipment !== 'all' ? { equipment } : {}),
+      // Checkbox multi-select: when `equipmentIds` is an array we ALWAYS send
+      // equipment_ids (a comma list; empty string = nothing selected), so the backend
+      // scopes charts to exactly those inverters. `equipment` stays for the legacy
+      // single-select callers. An absent equipment_ids param = all inverters.
+      ...(Array.isArray(equipmentIds) ? { equipment_ids: equipmentIds.join(',') }
+          : (equipment && equipment !== 'all' ? { equipment } : {})),
+      ...(equipmentType ? { equipment_type: equipmentType } : {}),
     },
   })
 
@@ -272,6 +281,22 @@ export const fetchDGRInverterSeries = (date, interval, tags) =>
     page_size:      2000,   // 1-minute buckets over a full day = 1440 rows
   }, interval, 'max'))
 
+// Per-inverter DAILY generation across an arbitrary range (used by the MGR
+// "Monthly Generation by Inverter" matrix). One 'daily' bucket per day; INVERTER_xx_GEN
+// resets at midnight, so the daily bucket MAX is that day's total generation for the
+// inverter. Returns one row per day, each carrying every inverter's value — exactly the
+// Date × Inverter grid. Same source/counter semantics as the DGR chart; no new SQL.
+export const fetchMGRInverterDaily = (fromDatetime, toDatetime, tags) =>
+  api.post('/api/v1/reports-v2/data', withAggregation({
+    equipment_type: 'Daily Generation',
+    equipment_id:   'INVERTER_DAILY_GEN',
+    tags,
+    from_datetime:  fromDatetime,
+    to_datetime:    toDatetime,
+    page:           1,
+    page_size:      2000,
+  }, 'daily', 'max'))
+
 // Per-inverter active power (kW) from [dbo].[POWER_GRAPH], over the same date +
 // interval. Read with MAX so each bucket carries that interval's peak; the day's
 // peak per inverter is the maximum across buckets.
@@ -285,6 +310,37 @@ export const fetchDGRInverterPower = (date, interval, tags) =>
     page:           1,
     page_size:      2000,
   }, interval, 'max'))
+
+// The WMS TimeCol column maps to the report's `timestamp`, so it's not requested as a
+// data tag — it's rendered from the timestamp value instead.
+export const WMS_TIME_COLUMN = 'TimeCol'
+
+// Every WMS column in EXACT database order, straight from the schema (data-driven —
+// the client's SQL SELECT list is the source of truth). Nothing is renamed/reordered.
+export const fetchWmsColumns = () =>
+  api.get('/api/v1/reports-v2/wms-columns')
+
+// WMS weather-station data over an ARBITRARY datetime range + interval. This is the one
+// shared WMS reader used by all three generation reports — DGR (a day), MGR (a month) and
+// YGR (a year) — so their WMS sections are byte-for-byte the same request shape, only the
+// range/interval differ. `columns` is the data-driven WMS column list; TimeCol is dropped
+// from the tag request (it's the timestamp). Values are returned as stored (bucket-
+// averaged) with NO counter/delta transform.
+export const fetchWmsSeriesRange = (fromDatetime, toDatetime, interval, columns, pageSize = 5000) =>
+  api.post('/api/v1/reports-v2/data', withAggregation({
+    equipment_type: 'WMS',
+    equipment_id:   'WMS',
+    tags:           (columns || []).filter(c => c !== WMS_TIME_COLUMN),
+    from_datetime:  fromDatetime,
+    to_datetime:    toDatetime,
+    page:           1,
+    page_size:      pageSize,
+  }, interval, 'avg'))
+
+// DGR WMS: the SAME date + interval as the DGR report, one day. Delegates to the shared
+// reader with the original 2000 page size so the DGR request is unchanged.
+export const fetchDGRWmsSeries = (date, interval, columns) =>
+  fetchWmsSeriesRange(`${date}T00:00:00`, `${date}T23:59:59`, interval, columns, 2000)
 
 // ── Multi-equipment report (Preconfigured Reports) ─────────────────────────
 // One timestamp-aligned dataset spanning several equipment types. `sources` is
@@ -422,6 +478,25 @@ export const resumeSchedule = (id) =>
 
 export const fetchScheduleRuns = (id) =>
   api.get(`/api/v1/scheduled/schedules/${id}/runs`)
+
+// ── Saved (Preconfigured) reports — database-backed CRUD ────────────────────
+// The full Reports-page configuration (equipment type, selected equipment, tags,
+// date range, interval, aggregation) persisted server-side so it survives a
+// refresh/restart and can be re-opened & re-run from the Preconfigured page.
+export const listSavedReports = () =>
+  api.get('/api/v1/saved-reports')
+
+export const createSavedReport = (payload) =>
+  api.post('/api/v1/saved-reports', payload)
+
+export const getSavedReport = (id) =>
+  api.get(`/api/v1/saved-reports/${id}`)
+
+export const updateSavedReport = (id, payload) =>
+  api.put(`/api/v1/saved-reports/${id}`, payload)
+
+export const deleteSavedReport = (id) =>
+  api.delete(`/api/v1/saved-reports/${id}`)
 
 // ── Users ──────────────────────────────────────────────────────────────────
 export const fetchUsers = () =>

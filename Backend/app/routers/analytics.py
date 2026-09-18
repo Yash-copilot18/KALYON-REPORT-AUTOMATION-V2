@@ -17,12 +17,17 @@ router = APIRouter(prefix="/analytics", tags=["Analytics"])
 def get_analytics_overview(
     from_date: Optional[str] = Query(default=None, description="YYYY-MM-DD (inclusive)"),
     to_date:   Optional[str] = Query(default=None, description="YYYY-MM-DD (inclusive)"),
-    equipment: Optional[str] = Query(default=None, description="'all' or an inverter id"),
+    equipment: Optional[str] = Query(default=None, description="'all' or a single inverter id (legacy)"),
+    equipment_ids: Optional[str] = Query(default=None,
+        description="Comma-separated inverter ids for the checkbox multi-select. Empty string = "
+                    "nothing selected (empty analytics); absent = all inverters. Overrides `equipment`."),
     db: Session = Depends(get_db),
 ):
     """KPIs, generation/PR trends and per-inverter ranking for one date range —
-    every value computed from real PPC / WMS / INVERTER_DAILY_GEN telemetry."""
-    return analytics_service.get_overview(db, from_date, to_date, equipment)
+    every value computed from real PPC / WMS / INVERTER_DAILY_GEN telemetry. When a
+    subset of inverters is selected, generation/PR/KPIs are recomputed from ONLY those
+    inverters."""
+    return analytics_service.get_overview(db, from_date, to_date, equipment, equipment_ids)
 
 
 @router.get("/performance", summary="Plant performance analytics")

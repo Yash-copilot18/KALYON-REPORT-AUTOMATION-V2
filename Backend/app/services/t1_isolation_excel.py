@@ -38,10 +38,8 @@ overlap. Per-device and total benchmarks (SQL time, Excel time, rows/s) are logg
 import os
 import re
 import time
-import shutil
 import zipfile
 import logging
-import tempfile
 import threading
 from datetime import datetime
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
@@ -50,7 +48,7 @@ from typing import List, Tuple, Optional, Callable, Iterator
 from sqlalchemy import text
 
 from app.database.session import SessionLocal
-from app.services import schema_cache, intervals
+from app.services import schema_cache, intervals, isolator_columns
 from app.services.smb_excel import _TEXT_TYPES                 # shared text-column set
 from app.repositories.reports_repository import _safe_name, _build_interval_expr
 
@@ -62,6 +60,11 @@ ZIP_MIME  = "application/zip"
 TAGS_PER_SHEET = 40         # NOT a tag limit — the per-worksheet split size
 _STREAM_CHUNK  = 64 * 1024  # single-device .xlsx is streamed in 64 KB chunks
 _READ_BATCH    = 10_000     # DB rows fetched per round-trip (server-side cursor batch)
+# Tracker Excel worksheet split: how many DEVICE Ids share one sheet. Each sheet carries
+# Timestamp + EVERY tag of each device in its block, grouped device-by-device. This is a
+# layout constant, never a limit on how many devices are exported — as many sheets are
+# emitted as the table actually has devices (Ids beyond 240 included).
+DEVICES_PER_SHEET = 40
 
 # Devices are built CONCURRENTLY (ProcessPoolExecutor for >1 device — each worker on
 # its OWN pooled DB connection and CPU core, so the CPU-bound xlsxwriter work and the
@@ -161,11 +164,11 @@ def _disp(table: str, label: Optional[str]) -> str:
     """
     PRESENTATION-layer device name — the only thing a user should see for a device.
 
-    For the operator-facing "Tracker" type the device is shown as Tracker{n}; the
-    internal/legacy isolation types keep ISO{n}. The physical table (equipment_id) is
-    NEVER changed by this — it exists purely so filenames, sheet names, headers and
-    progress messages read "Tracker{n}" while SQL/routing/caching/logging keep using
-    the real table name.
+    For the operator-facing "Tracker" type the device is shown as IS{nn} (IS01…IS24);
+    the internal/legacy isolation types keep ISO{n}. The physical table (equipment_id)
+    is NEVER changed by this — it exists purely so filenames, headers and progress
+    messages read "IS{nn}" while SQL/routing/caching/logging keep using the real table
+    name.
     """
     return tracker_name(table) if (label or "").strip() == "Tracker" else iso_name(table)
 
@@ -176,26 +179,43 @@ _ID_COL_RE = re.compile(r"^(.*)_ID(\d+)$", re.IGNORECASE)
 
 def _order_isolation_columns(cols: List[str]) -> List[str]:
     """
-    Client-required column order: every field belonging to the same numeric ID is
-    grouped together, IDs ascending (1, 2, 3, …), and within each ID the fields are
-    ordered alphabetically by prefix — ALARM, BATTERY_LEVEL, ELEVATION_POSITION,
-    ELEVATION_SETPOINT, MAX_MOTOR_CURRENT, OPERATION_MODE, … :
-
-        ALARM_ID1, BATTERY_LEVEL_ID1, … OPERATION_MODE_ID1,
-        ALARM_ID2, BATTERY_LEVEL_ID2, … OPERATION_MODE_ID2, …
-
-    Only the columns actually present are ordered, so a field missing for some ID is
-    simply absent — its slot is skipped and the ID's remaining fields still follow in
-    order (no gaps, no placeholders). Any column that does not match {FIELD}_ID{n}
-    keeps its original relative order and is placed after all ID-grouped columns.
-    (Timestamp is added separately as the first column by the caller.)
+    Client-required ID-first column order. Thin alias over the SHARED implementation in
+    `isolator_columns.order_columns_by_id`, which the Report Data API also calls — so
+    the Excel workbook and the on-screen table are guaranteed to use one ordering and
+    can never drift apart. Kept as a name so this module's existing callers are
+    unchanged; see the shared function for the full contract.
     """
-    def key(c: str):
+    return isolator_columns.order_columns_by_id(cols)
+
+
+def _sheet_local_header_fn(columns, base_header_fn):
+    """
+    Per-SHEET header labels that RESTART the device-Id numbering at 1 (client format).
+
+    Within one worksheet the isolator device Ids are remapped to a sheet-local 1-based
+    sequence, in order of first appearance — so every sheet begins at Id1 (e.g. a sheet
+    whose data belongs to devices 41–80 shows 'Alarm Id1 … Alarm Id40', 'Battery Level
+    Id1 …', etc.). ONLY the displayed HEADER text changes: the underlying column, its
+    data values, the column order and the sheet name are all untouched. Non-Id columns
+    (e.g. Timestamp) are formatted by the existing `base_header_fn` unchanged.
+    """
+    local: dict = {}
+    for c in columns:
         m = _ID_COL_RE.match(c)
         if m:
-            return (0, int(m.group(2)), m.group(1).upper())
-        return (1, 0, "")          # non-ID columns last; stable sort keeps their order
-    return sorted(cols, key=key)
+            gid = int(m.group(2))
+            if gid not in local:
+                local[gid] = len(local) + 1     # 1-based, per-sheet
+
+    def header_fn(col):
+        m = _ID_COL_RE.match(col)
+        if not m or int(m.group(2)) not in local:
+            return base_header_fn(col)          # timestamp / non-Id columns unchanged
+        # Reuse the SAME formatter with the sheet-local Id so the label format (casing,
+        # spacing, any unit) is byte-identical to before — only the number changes.
+        return base_header_fn(f"{m.group(1)}_ID{local[int(m.group(2))]}")
+
+    return header_fn
 
 
 def _d(dt) -> str:
@@ -324,7 +344,7 @@ def _resolve(req, equipment_ids) -> Tuple[List[str], List[str], dict, str, str, 
     meta = {
         "from": _d(req.from_datetime), "to": _d(req.to_datetime),
         "interval": interval if interval != "raw" else "Raw (all records)",
-        "agg": agg.upper(),
+        "agg": intervals.agg_word(agg),
         "label": req.equipment_type,   # "T1 Isolation" / "T2 Isolation" — for headers
     }
     # Selected tags, UI order preserved, injection-guarded — the ONLY source of
@@ -546,9 +566,10 @@ def _unique_path(directory: str, filename: str) -> str:
 def _build_tracker_workbook_dl(table: str, req_tags: List[str], meta: dict, from_str: str,
                                to_str: str, interval: str, agg: str, downloads: str):
     """
-    Pool worker: build ONE tracker's workbook — the selected tags split every
-    TAGS_PER_SHEET into worksheets named Tracker{n}_{start}-{end} (the tab suffix is the
-    1-based tag range on that sheet) — and stream it straight to Downloads\\Tracker{n}.xlsx.
+    Pool worker: build ONE tracker's workbook — the devices split every
+    DEVICES_PER_SHEET into worksheets named <disp>_{firstId}-{lastId}, each carrying
+    Timestamp plus EVERY tag of each device in its block grouped device-by-device — and
+    stream it straight to the report folder as <disp>.xlsx.
 
     Each tracker's rows are read from the database EXACTLY ONCE (one server-side-cursor
     query via `_iter_table_rows` → fetchmany, only the selected columns, ID-grouped
@@ -593,33 +614,93 @@ def _build_tracker_workbook_dl(table: str, req_tags: List[str], meta: dict, from
 
         path  = _unique_path(downloads, f"{disp}.xlsx")
         fname = os.path.basename(path)
-        t_xl  = time.time()
+        # Excel GENERATION (writing rows/sheets, constant-memory → streamed to disk) and
+        # SAVE (wb.close = flush + package the .xlsx) are timed separately so the export
+        # log can pinpoint each stage.
+        t_gen = time.time()
         wb  = xlsxwriter.Workbook(path, {"constant_memory": True})   # streamed to disk
-        fmt = make_formats(wb)                                       # formats built once
+        fmt = make_formats(wb)                                       # formats built ONCE per workbook
         used: set = set()
-        # Dynamic 40-tag split; tab = Tracker{n}_{start}-{end}. Every sheet renders its
-        # own slice of the SAME already-read rows (no extra query, no reorder).
-        chunks = [present[i:i + TAGS_PER_SHEET]
-                  for i in range(0, len(present), TAGS_PER_SHEET)] or [[]]
-        for i, chunk in enumerate(chunks):
-            start = i * TAGS_PER_SHEET + 1
-            end   = start + len(chunk) - 1 if chunk else start
-            sheet = safe_sheet_name(f"{disp}_{start}-{end}", used)
+        # ── Client layout: worksheets of 40 DEVICES, columns grouped BY DEVICE Id ───
+        # Each sheet holds Timestamp followed by EVERY tag of its first device, then
+        # every tag of the next device, and so on — Id-first, never tag-first:
+        #
+        #     <disp>_1-40    Timestamp | ALARM_ID1, BATTERY_LEVEL_ID1, … OPERATION_MODE_ID1
+        #                              | ALARM_ID2, BATTERY_LEVEL_ID2, … OPERATION_MODE_ID2
+        #                              | … through Id40
+        #     <disp>_41-80   … Ids 41-80, same shape
+        #
+        # `present` is already in exactly that order (`_order_isolation_columns` sorts by
+        # Id, then by tag prefix), so a sheet's columns are simply the slice of `present`
+        # whose Id falls in that sheet's block — the database order is preserved and no
+        # column is reordered, duplicated or dropped.
+        #
+        # Both the Ids and the tag list are DISCOVERED from the live table columns; the
+        # number of sheets follows the data, so a table with Ids past 240 emits the extra
+        # sheets too. Sheet names carry the ACTUAL first-last Id on that sheet, so a
+        # partial final block reads e.g. "<disp>_121-126", not "<disp>_121-160".
+        by_id: dict = {}
+        ungrouped: List[str] = []
+        for c in present:                                    # `present` order = Id-grouped
+            m = _ID_COL_RE.match(c)
+            if m:
+                by_id.setdefault(int(m.group(2)), []).append(c)
+            else:
+                ungrouped.append(c)
+
+        device_ids = sorted(by_id)
+        id_chunks = [device_ids[i:i + DEVICES_PER_SHEET]
+                     for i in range(0, len(device_ids), DEVICES_PER_SHEET)]
+
+        specs = []
+        for ids_chunk in id_chunks:
+            # Every tag of every device in this block, device by device (Id ascending).
+            block_cols = [c for did in ids_chunk for c in by_id[did]]
+            specs.append((f"{disp}_{ids_chunk[0]}-{ids_chunk[-1]}",
+                          ["timestamp"] + block_cols))
+        if ungrouped:
+            # Safety net: a present column that carries no _ID<n> suffix still gets a
+            # home, so nothing the query returned can be silently omitted.
+            specs.append((f"{disp}_Other", ["timestamp"] + ungrouped))
+
+        # Headers carry each column's REAL device Id ("Alarm Id41" on the 41-80 sheet),
+        # via the shared `col_header` used by every other report. The previous layout
+        # renumbered Ids per sheet — that suited one-metric-per-sheet tabs, but here it
+        # would label the 41-80 sheet's columns Id1…Id40 and contradict both the sheet
+        # name and the point of grouping by device. Only the label text differs; the
+        # column, its order and its values are untouched.
+        n_sheets = 0
+        for sheet_name, sheet_cols in specs:
+            sheet = safe_sheet_name(sheet_name, used)
             write_report_sheet_streaming(
-                wb, fmt, sheet, _header(), ["timestamp"] + chunk, iter(rows), col_header)
-        wb.close()
-        xlsx_s = time.time() - t_xl
-        return (disp, fname, len(rows), len(present), len(chunks), iso,
-                timings["db"], timings["xform"], xlsx_s)
+                wb, fmt, sheet, _header(), sheet_cols, iter(rows), col_header)
+            n_sheets += 1
+        if n_sheets == 0:                                    # never emit a zero-sheet file
+            write_report_sheet_streaming(
+                wb, fmt, safe_sheet_name(str(disp), used), _header(),
+                ["timestamp"], iter(rows), col_header)
+            n_sheets = 1
+        # VERIFICATION LOG: the EXACT sheet names + column counts written by the real
+        # Export Excel path, so the server log proves every device reached a sheet.
+        logger.info("Tracker Excel [%s] wrote %d sheet(s) | devices=%d | columns=%d | %s",
+                    disp, n_sheets, len(device_ids), len(present),
+                    [(nm, len(cols) - 1) for nm, cols in specs] or [str(disp)])
+        gen_s = time.time() - t_gen
+        t_save = time.time()
+        wb.close()                                                   # flush + package the .xlsx
+        save_s = time.time() - t_save
+        return (disp, fname, len(rows), len(present), n_sheets, iso,
+                timings["db"], timings["xform"], gen_s, save_s)
     finally:
         session.close()
 
 
 def export_to_downloads(req, equipment_ids, progress: Optional[Callable] = None) -> dict:
     """
-    Build ONE workbook PER tracker and save each to the user's Downloads folder:
+    Build ONE workbook PER tracker and save each under this report type's folder inside
+    the single "Reports" root (Reports/<type>/ — see downloads.resolve_reports_dir):
 
-        Tracker1.xlsx, Tracker2.xlsx, … Tracker24.xlsx
+        Reports/Tracker/IS01.xlsx, IS02.xlsx, … IS24.xlsx
 
     Inside each workbook the selected tags are split every TAGS_PER_SHEET into worksheets
     named  Tracker{n}_{start}-{end}  (e.g. Tracker1_1-40, Tracker1_41-80, Tracker1_81-120)
@@ -641,16 +722,15 @@ def export_to_downloads(req, equipment_ids, progress: Optional[Callable] = None)
     meta = dict(meta)
     meta.setdefault("label", "Tracker")
     n = len(devices)
-    # Files are generated into a TEMP build directory, then packed into ONE ZIP in
-    # Downloads that preserves the folder structure, and the temp dir is removed:
-    #     Downloads\Tracker_Reports_<ts>.zip
-    #         └─ Tracker_Reports_<ts>\Tracker1.xlsx, Tracker2.xlsx, …
-    # The workbooks — contents, sheet names, filenames — are UNCHANGED; only the
-    # packaging (a single ZIP instead of loose files) changed.
-    stamp     = time.strftime("%Y-%m-%d_%H%M%S")
-    arc_root  = f"Tracker_Reports_{stamp}"
-    downloads = _resolve_downloads_dir()
-    build_dir = tempfile.mkdtemp(prefix="trk_build_")
+    # Write each workbook DIRECTLY into this report type's folder under the single
+    # "Reports" root — Reports\<type>\T01.xlsx, T02.xlsx, … (no temp dir, no ZIP). The
+    # per-type folder is keyed off the LIVE equipment type, so every report type lands
+    # under the same Reports tree without hardcoding. Filenames, sheet names, layout,
+    # formatting and data are all UNCHANGED — only the destination folder changed.
+    from app.services.downloads import resolve_reports_dir
+    report_type = req.equipment_type or meta.get("label") or "Tracker"
+    target_dir  = resolve_reports_dir(report_type)
+    folder      = os.path.basename(target_dir)
 
     def emit(pct, msg):
         if progress:
@@ -659,67 +739,61 @@ def export_to_downloads(req, equipment_ids, progress: Optional[Callable] = None)
             except Exception:
                 pass
 
-    emit(2, f"Processing {n} tracker(s)…")
-    logger.info("Tracker ZIP export start -> trackers=%d | tags=%d | build=%s | workers=%d",
-                n, len(req_tags), build_dir, min(_MAX_WORKERS, n) or 1)
+    workers = min(_MAX_WORKERS, n) or 1
+    emit(2, f"Processing {n} tracker(s) → Reports…")
+    logger.info("Tracker export start -> trackers=%d | tags=%d | dir=%s | workers=%d",
+                n, len(req_tags), target_dir, workers)
 
     t0 = time.time()
     results = []
-    args = (req_tags, meta, from_str, to_str, interval, agg, build_dir)
-    try:
-        if n == 1:
-            results.append(_build_tracker_workbook_dl(devices[0], *args))
-        else:
-            # Independent per-tracker workbooks → true CPU-parallel builds (their SQL
-            # reads overlap too). Each worker has its OWN engine/connection; no shared state.
-            workers = min(_MAX_WORKERS, n)
-            with ProcessPoolExecutor(max_workers=workers) as ex:
-                futs = {ex.submit(_build_tracker_workbook_dl, t, *args): t for t in devices}
-                done = 0
-                for fut in as_completed(futs):
-                    res = fut.result()
-                    results.append(res)
-                    done += 1
-                    emit(5 + done * 88 / n, f"{res[0]} done ({done}/{n})…")
+    args = (req_tags, meta, from_str, to_str, interval, agg, target_dir)
+    if n == 1:
+        results.append(_build_tracker_workbook_dl(devices[0], *args))
+    else:
+        # Independent per-tracker workbooks → true CPU-parallel builds; their SQL reads
+        # overlap too. Each worker has its OWN pooled connection; no shared state. Every
+        # tracker is read from the DB EXACTLY once and reused across its range sheets.
+        with ProcessPoolExecutor(max_workers=workers) as ex:
+            futs = {ex.submit(_build_tracker_workbook_dl, t, *args): t for t in devices}
+            done = 0
+            for fut in as_completed(futs):
+                res = fut.result()
+                results.append(res)
+                done += 1
+                emit(5 + done * 93 / n, f"{res[0]} done ({done}/{n})…")
 
-        saved, total_sheets = [], 0
-        agg_sql = agg_xform = agg_excel = 0.0
-        for disp, fname, nrows, ntags, nsheets, iso, sql_s, xform_s, xl_s in results:
-            saved.append(fname); total_sheets += nsheets
-            agg_sql += sql_s; agg_xform += xform_s; agg_excel += xl_s
-            logger.info("BENCH %s | rows=%d | tags=%d | sheets=%d | sql_fetch=%.2fs | "
-                        "transform=%.2fs | excel=%.2fs", iso, nrows, ntags, nsheets, sql_s, xform_s, xl_s)
-        excel_s = max(time.time() - t0, 1e-6)
+    saved, written_paths, total_sheets = [], [], 0
+    sql_s = proc_s = excel_s = save_s = 0.0
+    for disp, fname, nrows, ntags, nsheets, iso, d_sql, d_proc, d_gen, d_save in results:
+        saved.append(fname)
+        written_paths.append(os.path.join(target_dir, fname))
+        total_sheets += nsheets
+        sql_s += d_sql; proc_s += d_proc; excel_s += d_gen; save_s += d_save
+        logger.info("BENCH %s | rows=%d | tags=%d | sheets=%d | sql=%.2fs | proc=%.2fs | "
+                    "excel=%.2fs | save=%.2fs", iso, nrows, ntags, nsheets, d_sql, d_proc, d_gen, d_save)
 
-        # ── Pack into ONE ZIP. STORED (no re-compression): each .xlsx is already a
-        # compressed zip, so deflating again burns CPU for ~0% size gain — STORED keeps
-        # ZIP creation fast. Arcname preserves the Tracker_Reports_<ts>\ folder inside.
-        emit(94, f"Packing {len(saved)} file(s) into {arc_root}.zip…")
-        tz = time.time()
-        zip_path = os.path.abspath(os.path.join(downloads, f"{arc_root}.zip"))
-        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_STORED, allowZip64=True) as zf:
-            for fname in saved:
-                zf.write(os.path.join(build_dir, fname), arcname=f"{arc_root}/{fname}")
-        zip_s = time.time() - tz
-    finally:
-        shutil.rmtree(build_dir, ignore_errors=True)   # always remove the temp dir
-
-    # Verify the archive really exists on disk — a reported success with no file means
-    # a wrong/unwritable location; surface it as an error instead of a false toast.
+    # Verify every workbook exists on disk (guards a wrong/unwritable location) — a
+    # reported success with no files must surface as an error, not a false toast.
     from app.services.downloads import verify_files_written
-    verify_files_written([zip_path])
+    verify_files_written(written_paths)
 
-    total_s = excel_s + zip_s
-    logger.info("BENCH TOTAL | Tracker ZIP | files=%d | sheets=%d | SQL(sum)=%.1fs | "
-                "transform(sum)=%.1fs | excel_gen=%.1fs | zip=%.2fs | total=%.1fs | workers=%d | saved=%s",
-                len(saved), total_sheets, agg_sql, agg_xform, excel_s, zip_s, total_s,
-                min(_MAX_WORKERS, n) or 1, zip_path)
-    logger.info("Tracker export SAVED -> %s", zip_path)
-    emit(100, f"Saved {len(saved)} report(s) to {zip_path}")
-    return {"zip": zip_path, "filename": f"{arc_root}.zip", "path": zip_path,
-            "directory": downloads, "saved": saved,
-            "count": len(saved), "sheets": total_sheets,
-            "excel_seconds": round(excel_s, 2), "zip_seconds": round(zip_s, 2),
+    total_s = max(time.time() - t0, 1e-6)
+    # Per-stage timing. The stage sums are total CPU work ACROSS trackers; Total is the
+    # real elapsed wall time, which is far lower because trackers build in parallel.
+    logger.info(
+        "Tracker export timing | trackers=%d | workers=%d\n"
+        "  SQL:        %.1f sec\n"
+        "  Processing: %.1f sec\n"
+        "  Excel:      %.1f sec\n"
+        "  Save:       %.1f sec\n"
+        "  Total:      %.1f sec (wall, parallel)",
+        n, workers, sql_s, proc_s, excel_s, save_s, total_s)
+    logger.info("Tracker export SAVED -> %s", target_dir)
+    emit(100, f"Saved {len(saved)} report(s) to {target_dir}")
+    return {"directory": target_dir, "path": target_dir, "folder_name": folder,
+            "saved": saved, "count": len(saved), "sheets": total_sheets,
+            "sql_seconds": round(sql_s, 2), "processing_seconds": round(proc_s, 2),
+            "excel_seconds": round(excel_s, 2), "save_seconds": round(save_s, 2),
             "total_seconds": round(total_s, 2)}
 
 
@@ -748,9 +822,17 @@ def _tracker_export_dir() -> str:
 
 
 def tracker_name(table: str) -> str:
-    """T1_IS3 → Tracker3, T2_IS13 → Tracker13 (the display name; DB still uses ISO)."""
+    """
+    Client display/export identifier for a Tracker device: T1_IS3 → IS03, T2_IS13 → IS13
+    (always two digits, leading zero; 100+ keep their length). This is presentation
+    ONLY — the physical table / equipment_id and every SQL/routing/cache key keep using
+    the real name (T{g}_IS{n}); only what the user sees in the UI selection, the Excel
+    identifier / headers, sheet and file names changes. Applies to the Tracker type
+    exclusively (via `_disp`, guarded on label == "Tracker") — String Combiner and the
+    other equipment types are unaffected.
+    """
     m = re.match(r"T\d+_IS0*(\d+)", table, re.IGNORECASE)
-    return f"Tracker{m.group(1)}" if m else table
+    return f"IS{int(m.group(1)):02d}" if m else table
 
 
 def _build_tracker_folder(table: str, req_tags: List[str], meta: dict, from_str: str,
@@ -809,9 +891,11 @@ def _build_tracker_folder(table: str, req_tags: List[str], meta: dict, from_str:
                 ],
             }
             used: set = set()
+            # Per-sheet device-Id numbering restarts at 1 (client format) — headers only.
+            sheet_cols = ["timestamp"] + chunk
             write_report_sheet_streaming(
                 wb, fmt, safe_sheet_name(f"Tags_{start}_{end}", used), header,
-                ["timestamp"] + chunk, iter(rows), col_header)
+                sheet_cols, iter(rows), _sheet_local_header_fn(sheet_cols, col_header))
             wb.close()
             files.append(fname)
         xl_secs = time.time() - t_xl
@@ -835,7 +919,9 @@ def export_trackers_to_folders(req, equipment_ids, progress: Optional[Callable] 
     devices, req_tags, meta, from_str, to_str, interval, agg = _resolve(req, equipment_ids)
     meta = dict(meta)
     meta["label"] = "Tracker"                       # display rename (DB still uses ISO)
-    base_dir = _tracker_export_dir()
+    # One "Reports" root, one subfolder per report type (Reports\<type>\...).
+    from app.services.downloads import resolve_reports_dir
+    base_dir = resolve_reports_dir(req.equipment_type or "Tracker")
     n = len(devices)
 
     def emit(pct, msg):

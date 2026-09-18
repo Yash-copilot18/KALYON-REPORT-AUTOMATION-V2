@@ -366,7 +366,7 @@ EQUIPMENT_REGISTRY = {
     # The single equipment type shown in the Reports dropdown for the isolation
     # devices. It spans the SAME physical ISO tables (T1_IS1…T1_IS12, T2_IS13…
     # T2_IS24) — the database tables and every SQL query are unchanged. The devices
-    # are DISPLAYED as Tracker1…Tracker24 (see get_equipment_list), but their
+    # are DISPLAYED as IS01…IS24 (see get_equipment_list), but their
     # equipment_id remains the real table name, so tag/preview/export/scheduled flows
     # route to the existing T1/T2 isolation services with no business-logic changes.
     # "T1 Isolation"/"T2 Isolation" are retained above purely for internal routing and
@@ -449,12 +449,15 @@ class ReportsRepository:
             raise HTTPException(400, detail=f"Unknown type: {equipment_type}")
 
         def _display(table: str) -> str:
-            # The merged "Tracker" type shows its devices as Tracker<n>; the legacy
-            # T1/T2 Isolation types (internal only) still show ISO<n>. Underlying tables
-            # are T1_IS1…T1_IS12 / T2_IS13…T2_IS24 in every case (never renamed).
+            # The merged "Tracker" type shows its devices as IS<nn> (IS01…IS24, the
+            # zero-padded isolation index from T1_IS1…T1_IS12 / T2_IS13…T2_IS24); the
+            # legacy T1/T2 Isolation types (internal only) still show ISO<n>. The
+            # underlying tables are NEVER renamed — equipment_id stays the real table
+            # name, so selection / tags / preview / export / report generation route on
+            # the actual T{g}_IS{n} tables; only this label changes.
             m = re.match(r"T\d+_IS0*(\d+)", table, re.IGNORECASE)
             if equipment_type == "Tracker" and m:
-                return f"Tracker{m.group(1)}"
+                return f"IS{int(m.group(1)):02d}"
             if equipment_type in ("T1 Isolation", "T2 Isolation") and m:
                 return f"ISO{m.group(1)}"
             return table.replace("_", " ")

@@ -15,11 +15,10 @@
 // Excel is the only export format offered on this page by design.
 
 import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react'
-import { PageHeader, FormRow, FormGroup, Spinner, Skeleton } from '../../components/Common'
+import { PageHeader, FormGroup, Spinner, Skeleton } from '../../components/Common'
 import { useApp } from '../../utils/AppContext'
 import {
-  INTERVALS, INTERVAL_LABELS, AGG_OPTIONS, DEFAULT_AGG,
-  showsAggregation,
+  INTERVAL_LABELS, AGG_OPTIONS, DEFAULT_AGG, withAggregation,
 } from '../../utils/intervals'
 import { getPreset } from '../../utils/reportPresets'
 import {
@@ -31,11 +30,16 @@ import {
   fetchReportTags,
   fetchMultiReportData,
   exportMultiReportExcel,
+  listSavedReports,
+  updateSavedReport,
+  deleteSavedReport,
+  fetchMergedPage,
 } from '../../services/api'
 
 // The only report types this page supports.
 const EQ_TYPES  = ['Inverter', 'WMS', 'PPC']
 const PAGE_SIZES = [50, 100]
+const AGG_LABEL = Object.fromEntries(AGG_OPTIONS.map(o => [o.value, o.label]))
 
 function fmtTimestamp(val) {
   if (!val) return '—'
@@ -91,6 +95,24 @@ function payloadFromConfig(c, pageNum, size) {
   }
 }
 
+// Build the report-data request for a backend saved report (from the Reports page),
+// using the SAME merged-page endpoint the Reports page uses — so the inline table
+// shows identical columns/data. withAggregation() drops the aggregation on instant
+// intervals; equipment_ids drives the merged multi-equipment view.
+function backendReportPayload(r, pageNum, size) {
+  const ids = (r.equipment_ids || []).filter(id => id && String(id).trim())
+  return withAggregation({
+    equipment_type: r.equipment_type,
+    equipment_id:   ids[0] || '',
+    equipment_ids:  ids,
+    tags:           r.tags || [],
+    from_datetime:  toISO(r.from_date),
+    to_datetime:    toISO(r.to_date),
+    page:           pageNum,
+    page_size:      size,
+  }, r.interval, r.agg_function)
+}
+
 // ── Main page ────────────────────────────────────────────────────────────────
 export default function Preconfigured() {
   const { showToast } = useApp()
@@ -119,16 +141,89 @@ export default function Preconfigured() {
   const [page,       setPage]       = useState(1)
   const [pageSize,   setPageSize]   = useState(PAGE_SIZES[0])
 
-  // ── Templates (front-end only; localStorage, never touches the backend) ────
-  const [templates,  setTemplates]  = useState(() => listTemplates())
-  const [tplId,      setTplId]      = useState('')   // template selected in the dropdown
+  // ── Saved Templates — UNIFIED from two stores ─────────────────────────────
+  // (1) Reports saved from the Reports page → backend DB (durable, survives refresh
+  //     and works across browsers). Loaded via listSavedReports().
+  // (2) Multi-equipment builder templates generated on THIS page → localStorage.
+  // Both are shown together in the one "Saved Templates" dropdown so a report saved
+  // on the Reports page appears here immediately (root cause of the bug: this page
+  // previously read ONLY localStorage and never the backend).
+  const [templates,  setTemplates]  = useState(() => listTemplates())   // localStorage builder templates
+  const [savedReports, setSavedReports] = useState([])                  // backend reports (Reports page)
+  const [loadingSaved, setLoadingSaved] = useState(true)
+  const [tplId,      setTplId]      = useState('')   // unified dropdown key (see itemKey)
   const refreshTemplates = useCallback(() => setTemplates(listTemplates()), [])
+  const refreshSavedReports = useCallback(() => {
+    setLoadingSaved(true)
+    return listSavedReports()
+      .then(data => setSavedReports(Array.isArray(data) ? data : []))
+      .catch(() => setSavedReports([]))
+      .finally(() => setLoadingSaved(false))
+  }, [])
 
-  // A template that has been Opened: its config is loaded on the page. While it is
-  // opened-but-not-editing the configuration controls are locked (read-only) — the
-  // user clicks Edit to unlock them. `openedTplId` is the Save-Changes target.
-  const [openedTplId, setOpenedTplId] = useState('')
-  const [locked,      setLocked]      = useState(false)
+  // Load backend saved reports on mount so newly-saved reports appear here.
+  useEffect(() => { refreshSavedReports() }, [refreshSavedReports])
+
+  // Unified dropdown model. Backend records are keyed "db:<id>" so they never collide
+  // with localStorage ids; each item carries its source + original record so the
+  // action handlers route to the correct store.
+  const dropdownItems = useMemo(() => ([
+    ...savedReports.map(r => ({ key: `db:${r.id}`, name: r.name, source: 'backend', record: r })),
+    ...templates.map(t => ({ key: t.id, name: t.name, source: 'local', record: t })),
+  ]), [savedReports, templates])
+
+  const selectedItem = useMemo(
+    () => dropdownItems.find(i => i.key === tplId) || null, [dropdownItems, tplId])
+
+  // What the bottom "Report Data" table currently shows: a builder ('local') report
+  // or an opened backend saved report ('backend'). It changes how column labels are
+  // resolved and which endpoint pagination uses — the table markup stays shared, so
+  // the report table is never duplicated across pages.
+  const [viewSource,     setViewSource]     = useState(null)   // 'local' | 'backend' | null
+  const [backendRec,     setBackendRec]     = useState(null)   // the opened backend record
+  const [backendTagMeta, setBackendTagMeta] = useState({})     // column_name → {tag, unit}
+
+  // Load one page of an opened backend saved report INLINE (no navigation), reusing
+  // the shared `result` state + the page's existing Report Data table.
+  const loadBackendPage = useCallback(async (rec, pageNum, size) => {
+    if (!rec) return
+    setGenerating(true); setError(null)
+    try {
+      const data = await fetchMergedPage(backendReportPayload(rec, pageNum, size))
+      const count = data.equipment_count || (rec.equipment_ids || []).length
+      setResult({
+        columns:       data.columns || [],
+        rows:          data.rows || [],
+        total_records: data.total_records || 0,
+        interval:      data.interval,
+        sources:       Array.from({ length: count }, (_, i) => i),  // for the header count
+      })
+      setPage(pageNum); setPageSize(size)
+    } catch (e) {
+      setError(e.message || 'Failed to load report'); setResult(null)
+    } finally {
+      setGenerating(false)
+    }
+  }, [])
+
+  // The template currently OPENED on the page — the single target for Edit / Save
+  // Changes / the status line. { key, source:'local'|'backend', id, name } | null.
+  // Works for BOTH stores (local builder templates AND backend saved reports), so the
+  // action buttons enable/disable identically regardless of where the template lives.
+  const [openedTpl, setOpenedTpl] = useState(null)
+  const [editing,   setEditing]   = useState(false)   // Edit mode is ON (controls unlocked)
+  const [dirty,     setDirty]     = useState(false)   // an ACTUAL change was made since Edit
+
+  // Editable column (tag) selection for an opened BACKEND saved report — its type
+  // (String Combiner, Tracker, Inverter, …) can't be represented by the multi-type
+  // builder, so Edit exposes its own tag checklist here. Loaded when Edit is clicked.
+  const [beTags,        setBeTags]        = useState([])   // full tag list of the report's equipment
+  const [beSelected,    setBeSelected]    = useState([])   // ordered column_names currently chosen
+  const [beLoadingTags, setBeLoadingTags] = useState(false)
+
+  // The builder (local templates) is read-only while an opened LOCAL template is not
+  // being edited; a fresh/generated config, or an active Edit, is fully editable.
+  const locked = !!openedTpl && openedTpl.source === 'local' && !editing
 
   // Set true immediately before a template load so the "seed interval/agg from the
   // first type" effect below does NOT overwrite the values the template restored.
@@ -182,6 +277,7 @@ export default function Preconfigured() {
     patch(type, { eqId })
     setSelected(sel => sel.filter(s => s.type !== type))
     setResult(null)
+    setDirty(true)                    // an edit → Save Changes becomes enabled
     loadTags(type, eqId)
   }, [locked, patch, loadTags])
 
@@ -206,6 +302,7 @@ export default function Preconfigured() {
       ? prev.filter(s => selKey(s) !== selKey(entry))
       : [...prev, entry])          // appended → selection order is the column order
     setResult(null)
+    setDirty(true)                 // an edit → Save Changes becomes enabled
   }, [locked])
 
   const selectedKeys = useMemo(() => new Set(selected.map(selKey)), [selected])
@@ -333,11 +430,12 @@ export default function Preconfigured() {
 
   const handleGenerate = useCallback(async () => {
     if (!ready) return showToast('Select at least one column')
+    setViewSource('local'); setBackendRec(null)   // the table now shows a builder report
     const ok = await runReport(1, pageSize)
     if (!ok) return
     // A fresh generate is a NEW configuration — it is never the opened template, so
-    // clear any open/lock state so the page is fully editable again.
-    setOpenedTplId(''); setLocked(false)
+    // clear any opened/edit state so the page is fully editable again.
+    setOpenedTpl(null); setEditing(false); setDirty(false)
     const res = createAutoTemplate(autoTemplateName(), snapshotConfig())
     if (res.ok) {
       refreshTemplates()
@@ -349,16 +447,49 @@ export default function Preconfigured() {
 
   // ── Template actions (Open · Edit · Save Changes · Rename · Delete) ────────
 
-  // Open: load the template's whole configuration into the page AND show its report
-  // preview immediately. Controls are LOCKED (read-only) until the user clicks Edit.
+  // Open: load the selected saved template's whole configuration and show its report
+  // table INLINE on this page (never navigates away, never duplicates the table).
+  //  · Backend saved report (from the Reports page) → load its data through the same
+  //    merged-page endpoint the Reports page uses and render it here.
+  //  · localStorage builder template → load into THIS page's builder + preview.
   const handleTplOpen = useCallback(async () => {
-    if (!tplId) return showToast('Select a template to open')
-    const tpl = templates.find(t => t.id === tplId)
-    if (!tpl) return showToast('Template not found')
+    if (!selectedItem) return showToast('Select a template to open')
 
+    // Entering Open always starts a fresh, non-editing view of the chosen template.
+    setEditing(false); setDirty(false)
+    setBeTags([]); setBeSelected([])
+
+    if (selectedItem.source === 'backend') {
+      const rec = selectedItem.record
+      setViewSource('backend'); setBackendRec(rec)
+      // Mark this backend report as the ACTIVE opened template so Edit/Save/Rename/Delete
+      // all target it (its columns are edited via the tag checklist under Report Columns).
+      setOpenedTpl({ key: selectedItem.key, source: 'backend', id: rec.id, name: rec.name })
+      setBackendTagMeta({})
+      // Clear the multi-equipment builder above so it doesn't show stale, unrelated
+      // selections — this backend report's configuration is summarised in the Report
+      // Data card below, next to its table.
+      setTypes([]); setActiveType(''); setSelected([]); setSrcs({})
+      // Friendly column labels/units (best-effort), same as the Reports page headers.
+      const primary = (rec.equipment_ids || [])[0]
+      if (primary) {
+        fetchReportTags(rec.equipment_type, primary)
+          .then(d => {
+            const list = Array.isArray(d) ? d : (d?.tags || [])
+            const m = {}; list.forEach(t => { m[t.column_name] = t })
+            setBackendTagMeta(m)
+          })
+          .catch(() => {})
+      }
+      await loadBackendPage(rec, 1, pageSize)
+      showToast(`Opened "${rec.name}"`)
+      return
+    }
+
+    const tpl = selectedItem.record
+    setViewSource('local'); setBackendRec(null)
     applyTemplate(tpl)                 // populate every control from the config
-    setOpenedTplId(tpl.id)
-    setLocked(true)                    // opened, not yet editing
+    setOpenedTpl({ key: selectedItem.key, source: 'local', id: tpl.id, name: tpl.name })
 
     // Preview straight from the stored config so the user immediately sees the same
     // report that was generated before (no wait for the async tag loads).
@@ -372,64 +503,182 @@ export default function Preconfigured() {
       setGenerating(false)
     }
     showToast(`Opened "${tpl.name}"`)
-  }, [tplId, templates, applyTemplate, pageSize, showToast])
+  }, [selectedItem, applyTemplate, loadBackendPage, pageSize, showToast])
 
-  // Edit: unlock the controls of the currently opened template for modification.
-  const handleTplEdit = useCallback(() => {
-    if (!openedTplId) return showToast('Open a template first, then Edit')
-    setLocked(false)
-    const tpl = templates.find(t => t.id === openedTplId)
-    showToast(`Editing "${tpl?.name || 'template'}" — change anything, then Save Changes`)
-  }, [openedTplId, templates, showToast])
+  // Edit: enter edit mode for the OPENED template (local OR backend). For a backend
+  // saved report, load its equipment's full tag list so its columns can be modified via
+  // the checklist under Report Columns, pre-checking the report's current tags.
+  const handleTplEdit = useCallback(async () => {
+    if (!openedTpl) return showToast('Open a template first, then Edit')
+    setEditing(true); setDirty(false)
 
-  // Save Changes: write the current configuration back to the opened template.
-  const handleTplUpdate = useCallback(() => {
-    const targetId = openedTplId || tplId
-    if (!targetId) return showToast('Open a template first')
-    const res = updateTemplate(targetId, snapshotConfig())
+    if (openedTpl.source === 'backend' && backendRec) {
+      setBeLoadingTags(true)
+      const primary = (backendRec.equipment_ids || [])[0]
+      try {
+        const d = await fetchReportTags(backendRec.equipment_type, primary)
+        const list = Array.isArray(d) ? d : (d?.tags || [])
+        setBeTags(list)
+        // Pre-select the report's saved tags that still exist on the equipment.
+        const have = new Set(list.map(t => t.column_name))
+        setBeSelected((backendRec.tags || []).filter(c => have.has(c)))
+      } catch {
+        setBeTags([]); setBeSelected([...(backendRec.tags || [])])
+      } finally {
+        setBeLoadingTags(false)
+      }
+    }
+    showToast(`Editing "${openedTpl.name}" — change columns, then Save Changes`)
+  }, [openedTpl, backendRec, showToast])
+
+  // Save Changes: persist the modifications back to the SAME opened template (same id,
+  // never a new one). Local → localStorage config; backend → PUT /saved-reports/{id}
+  // with the edited tag list. Reopening/refresh then shows the updated values.
+  const handleTplUpdate = useCallback(async () => {
+    if (!openedTpl) return showToast('Open a saved template first')
+
+    if (openedTpl.source === 'backend') {
+      const r = backendRec
+      if (!r) return showToast('Open the report first')
+      if (!beSelected.length) return showToast('Select at least one column')
+      try {
+        await updateSavedReport(r.id, {
+          name:           r.name,                 // rename is a separate action
+          equipment_type: r.equipment_type,
+          equipment_ids:  r.equipment_ids || [],
+          tags:           beSelected,             // the EDITED columns
+          from_date:      r.from_date,
+          to_date:        r.to_date,
+          interval:       r.interval,
+          agg_function:   r.agg_function,
+          page_size:      r.page_size,
+        })
+        await refreshSavedReports()
+        const updated = { ...r, tags: beSelected, tag_count: beSelected.length }
+        setBackendRec(updated)
+        setEditing(false); setDirty(false)
+        await loadBackendPage(updated, 1, pageSize)   // reload the table with new columns
+        showToast(`Saved changes to "${r.name}"`)
+      } catch (e) {
+        showToast(`Save failed: ${e.message}`)
+      }
+      return
+    }
+
+    const res = updateTemplate(openedTpl.id, snapshotConfig())
     if (!res.ok) return showToast(res.error)
     refreshTemplates()
-    setLocked(true)                    // saved → back to read-only view
+    setEditing(false); setDirty(false)             // saved → back to read-only view
     showToast(`Saved changes to "${res.template.name}"`)
-  }, [openedTplId, tplId, snapshotConfig, refreshTemplates, showToast])
+  }, [openedTpl, backendRec, beSelected, snapshotConfig, refreshSavedReports,
+      refreshTemplates, loadBackendPage, pageSize, showToast])
 
-  // Rename: prompt for a new name (no separate name field on the page).
-  const handleTplRename = useCallback(() => {
-    if (!tplId) return showToast('Select a template to rename')
-    const tpl = templates.find(t => t.id === tplId)
-    const next = window.prompt('Rename template', tpl?.name || '')
+  // Rename: prompt for a new name — routed to the correct store by source.
+  const handleTplRename = useCallback(async () => {
+    if (!selectedItem) return showToast('Select a template to rename')
+    const next = window.prompt('Rename template', selectedItem.name || '')
     if (next === null) return          // user cancelled
-    const res = renameTemplate(tplId, next)
-    if (!res.ok) return showToast(res.error)
-    refreshTemplates()
-    showToast(`Renamed to "${res.template.name}"`)
-  }, [tplId, templates, refreshTemplates, showToast])
+    const clean = String(next).trim()
+    if (!clean) return showToast('Template name is required')
 
-  const handleTplDelete = useCallback(() => {
-    if (!tplId) return showToast('Select a template to delete')
-    const tpl = templates.find(t => t.id === tplId)
-    if (tpl && !window.confirm(`Delete template "${tpl.name}"? This cannot be undone.`)) return
-    const res = deleteTemplate(tplId)
+    if (selectedItem.source === 'backend') {
+      // PUT requires the full config (backend validates it) — resend the record with
+      // only the name changed, so nothing else is modified.
+      const r = selectedItem.record
+      try {
+        await updateSavedReport(r.id, {
+          name: clean,
+          equipment_type: r.equipment_type,
+          equipment_ids:  r.equipment_ids || [],
+          tags:           r.tags || [],
+          from_date:      r.from_date,
+          to_date:        r.to_date,
+          interval:       r.interval,
+          agg_function:   r.agg_function,
+          page_size:      r.page_size,
+        })
+        await refreshSavedReports()
+        if (openedTpl?.key === selectedItem.key) {
+          setOpenedTpl(t => (t ? { ...t, name: clean } : t))
+          setBackendRec(rec => (rec ? { ...rec, name: clean } : rec))
+        }
+        showToast(`Renamed to "${clean}"`)
+      } catch (e) {
+        showToast(`Rename failed: ${e.message}`)
+      }
+      return
+    }
+
+    const res = renameTemplate(selectedItem.record.id, clean)
     if (!res.ok) return showToast(res.error)
     refreshTemplates()
-    if (openedTplId === tplId) { setOpenedTplId(''); setLocked(false) }
+    if (openedTpl?.key === selectedItem.key) setOpenedTpl(t => (t ? { ...t, name: clean } : t))
+    showToast(`Renamed to "${res.template.name}"`)
+  }, [selectedItem, openedTpl, refreshSavedReports, refreshTemplates, showToast])
+
+  const handleTplDelete = useCallback(async () => {
+    if (!selectedItem) return showToast('Select a template to delete')
+    if (!window.confirm(`Delete "${selectedItem.name}"? This cannot be undone.`)) return
+
+    // Deleting only removes the saved CONFIGURATION (DB row / localStorage entry); it
+    // never touches generated Excel files under Downloads\Reports.
+    const wasOpened = openedTpl?.key === selectedItem.key
+    const clearOpened = () => {
+      if (wasOpened) {
+        setOpenedTpl(null); setEditing(false); setDirty(false)
+        setViewSource(null); setBackendRec(null); setResult(null)
+        setBeTags([]); setBeSelected([])
+      }
+    }
+
+    if (selectedItem.source === 'backend') {
+      try {
+        await deleteSavedReport(selectedItem.record.id)
+        await refreshSavedReports()
+        clearOpened()
+        setTplId('')
+        showToast('Saved report deleted')
+      } catch (e) {
+        showToast(`Delete failed: ${e.message}`)
+      }
+      return
+    }
+
+    const localId = selectedItem.record.id
+    const res = deleteTemplate(localId)
+    if (!res.ok) return showToast(res.error)
+    refreshTemplates()
+    clearOpened()
     setTplId('')
     showToast('Template deleted')
-  }, [tplId, openedTplId, templates, refreshTemplates, showToast])
+  }, [selectedItem, openedTpl, refreshSavedReports, refreshTemplates, showToast])
 
   // ── Preview table ─────────────────────────────────────────────────────────
+  // Shared by BOTH view sources so the report table is never duplicated:
+  //  · builder ('local')  → labels come from the multi-report result.labels.
+  //  · backend saved report → merged columns include "_equipment"; tag labels come
+  //    from the fetched tag metadata (same friendly "Tag (unit)" as the Reports page).
   const tableCols = useMemo(() => {
     const cols   = result?.columns || []
     const labels = result?.labels  || {}
-    return [
+    const ordered = [
+      ...cols.filter(c => c === '_equipment'),
       ...cols.filter(c => c === 'timestamp'),
-      ...cols.filter(c => c !== 'timestamp'),
-    ].map(c => ({
-      key: c,
-      isTs: c === 'timestamp',
-      label: c === 'timestamp' ? 'Timestamp (DD/MM/YYYY HH:MM:SS)' : (labels[c] || c),
-    }))
-  }, [result?.columns, result?.labels])
+      ...cols.filter(c => c !== 'timestamp' && c !== '_equipment'),
+    ]
+    return ordered.map(c => {
+      if (c === '_equipment') return { key: c, isTs: false, isEq: true, label: 'Equipment' }
+      if (c === 'timestamp')  return { key: c, isTs: true, label: 'Timestamp (DD/MM/YYYY HH:MM:SS)' }
+      if (viewSource === 'backend') {
+        const m = backendTagMeta[c]
+        const label = m
+          ? (m.unit ? `${m.tag} (${m.unit})` : m.tag)
+          : c.replace(/_/g, ' ').replace(/\b\w/g, ch => ch.toUpperCase())
+        return { key: c, isTs: false, label }
+      }
+      return { key: c, isTs: false, label: labels[c] || c }
+    })
+  }, [result?.columns, result?.labels, viewSource, backendTagMeta])
 
   const rows       = result?.rows || []
   const totalRows  = result?.total_records || 0
@@ -439,20 +688,20 @@ export default function Preconfigured() {
     <div>
       <PageHeader title="Preconfigured Reports" />
 
-      {/* Templates — a history of generated report configurations. Every Generate
+      {/* Saved Templates — a history of generated report configurations. Every Generate
           Report below adds the configuration here automatically; the user never
           creates one by hand. Pure front-end (localStorage); does not affect report
           generation or Excel export. */}
       <div className="card mb-3">
-        <div className="card-title">Templates</div>
+        <div className="card-title">Saved Templates</div>
         <div className="flex flex-wrap items-end gap-x-4 gap-y-3">
-          <FormGroup label="Generated Templates">
+          <FormGroup label="Saved Templates">
             <select className="form-control" style={{ minWidth: 260 }}
               value={tplId}
               onChange={e => setTplId(e.target.value)}>
-              <option value="">— Select a generated report —</option>
-              {templates.map(t => (
-                <option key={t.id} value={t.id}>{t.name}</option>
+              <option value="">— Select a saved template —</option>
+              {dropdownItems.map(it => (
+                <option key={it.key} value={it.key}>{it.name}</option>
               ))}
             </select>
           </FormGroup>
@@ -464,12 +713,12 @@ export default function Preconfigured() {
               📂 Open
             </button>
             <button type="button" className="btn btn-primary btn-sm"
-              onClick={handleTplEdit} disabled={!openedTplId || !locked}
+              onClick={handleTplEdit} disabled={!openedTpl || editing}
               title="Enable editing of the opened template">
               ✏ Edit
             </button>
             <button type="button" className="btn btn-outline btn-sm"
-              onClick={handleTplUpdate} disabled={!openedTplId || locked}
+              onClick={handleTplUpdate} disabled={!editing || !dirty}
               title="Save your modifications back to the opened template">
               ✔ Save Changes
             </button>
@@ -486,98 +735,99 @@ export default function Preconfigured() {
           </div>
 
           <span className="ml-auto self-end pb-2 text-[11px] font-mono text-ge-text3">
-            {openedTplId
-              ? (locked ? '🔒 Opened (read-only) — click Edit to modify' : '✏ Editing — Save Changes when done')
-              : `${templates.length} generated report${templates.length === 1 ? '' : 's'}`}
+            {openedTpl
+              ? (editing
+                  ? (dirty ? '✏ Editing — Save Changes to persist' : '✏ Editing — change columns, then Save Changes')
+                  : '🔒 Opened (read-only) — click Edit to modify')
+              : loadingSaved
+                ? 'Loading saved templates…'
+                : `${dropdownItems.length} saved template${dropdownItems.length === 1 ? '' : 's'}`}
           </span>
         </div>
       </div>
 
-      {/* Equipment types — several may be active at once */}
-      <div className="card mb-3">
-        <div className="card-title">Equipment Types</div>
-        <div className="flex flex-wrap gap-2">
-          {EQ_TYPES.map(t => {
-            const on = types.includes(t)
-            const n  = selected.filter(s => s.type === t).length
-            return (
-              <button key={t} onClick={() => toggleType(t)} disabled={locked}
-                className={`btn btn-sm ${on ? 'btn-primary' : 'btn-outline'}`}>
-                {on ? '✓ ' : '+ '}{t}{n > 0 ? ` (${n})` : ''}
-              </button>
-            )
-          })}
-          {types.length > 0 && (
-            <span className="ml-auto text-[11px] font-mono text-ge-text3 self-center">
-              {types.length} type{types.length > 1 ? 's' : ''} · {selected.length} column
-              {selected.length === 1 ? '' : 's'} selected
-            </span>
-          )}
-        </div>
+      {/* Equipment Types section removed from the UI per client request. The equipment
+          selection state (types / selected columns / equipment identifiers) is preserved
+          and is populated by opening a Saved Template above — report generation and Excel
+          export logic are unchanged. */}
 
-        {/* One equipment identifier per selected type */}
-        {types.length > 0 && (
-          <div className="grid gap-3 mt-3 md:grid-cols-3">
-            {types.map(t => {
-              const s = srcs[t] || {}
-              return (
-                <FormGroup key={t} label={`${t} — Equipment Identifier`}>
-                  {s.loadingEq ? (
-                    <div className="form-control flex items-center gap-2 text-ge-text3 text-[12px]">
-                      <Spinner size={12} /> Loading...
-                    </div>
-                  ) : (
-                    <select className="form-control" value={s.eqId || ''}
-                      onChange={e => changeEquipment(t, e.target.value)}
-                      disabled={locked || !(s.eqList || []).length}>
-                      {(s.eqList || []).map(e => (
-                        <option key={e.equipment_id} value={e.equipment_id}>
-                          {e.display_name || e.equipment_id}
-                        </option>
-                      ))}
-                    </select>
-                  )}
-                </FormGroup>
-              )
-            })}
-          </div>
-        )}
-      </div>
-
-      {/* Filters */}
-      <div className="card mb-3">
-        <div className="card-title">Report Configuration</div>
-        <FormRow>
-          <FormGroup label="From Date">
-            <input type="datetime-local" className="form-control" disabled={locked}
-              value={fromDate} onChange={e => setFromDate(e.target.value)} />
-          </FormGroup>
-          <FormGroup label="To Date">
-            <input type="datetime-local" className="form-control" disabled={locked}
-              value={toDate} onChange={e => setToDate(e.target.value)} />
-          </FormGroup>
-          <FormGroup label="Time Interval">
-            <select className="form-control" value={interval} disabled={locked}
-              onChange={e => { setInterval(e.target.value); setAgg(DEFAULT_AGG) }}>
-              {INTERVALS.map(v => <option key={v} value={v}>{INTERVAL_LABELS[v]}</option>)}
-            </select>
-          </FormGroup>
-          {showsAggregation(interval) && (
-            <FormGroup label="Aggregation">
-              <select className="form-control" value={agg} disabled={locked}
-                onChange={e => setAgg(e.target.value)}>
-                {AGG_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
-              </select>
-            </FormGroup>
-          )}
-        </FormRow>
-      </div>
+      {/* Report Configuration section (From/To Date, Time Interval, Aggregation) removed
+          from the UI per client request. The underlying date/interval/aggregation state is
+          KEPT — it still drives report generation, Excel export and template save/restore,
+          and is populated by opening a Saved Template above (or its defaults). The page now
+          goes straight from Saved Templates to Report Columns. */}
 
       {/* Columns */}
       <div className="card mb-3">
         <div className="card-title">Report Columns</div>
 
-        {types.length === 0 ? (
+        {openedTpl?.source === 'backend' ? (
+          !editing ? (
+            <div className="py-6 text-center text-[12px] text-ge-text3">
+              Click <span className="text-ge-text1 font-semibold">Edit</span> to modify the columns of “{openedTpl.name}”.
+            </div>
+          ) : (
+            /* Editable column (tag) checklist for the opened BACKEND saved report. */
+            <div>
+              <div className="flex flex-wrap items-center gap-2 mb-2">
+                <span className="text-[11px] text-ge-text2">
+                  Editing columns · <span className="font-semibold">{backendRec?.equipment_type}</span>
+                  {' · '}{(backendRec?.equipment_ids || []).length} equipment
+                </span>
+                <div className="ml-auto flex items-center gap-1.5">
+                  <span className="text-[10px] font-mono text-ge-text3">{beSelected.length} / {beTags.length}</span>
+                  <button type="button" className="btn btn-outline btn-sm" disabled={!beTags.length}
+                    onClick={() => { setBeSelected(beTags.map(t => t.column_name)); setDirty(true) }}>
+                    ✓ Select All
+                  </button>
+                  <button type="button" className="btn btn-outline btn-sm" disabled={!beSelected.length}
+                    onClick={() => { setBeSelected([]); setDirty(true) }}>
+                    ✕ Clear
+                  </button>
+                </div>
+              </div>
+              <div className="relative mb-2">
+                <span className="absolute left-2.5 top-1/2 -translate-y-1/2 text-ge-text3 text-[11px]">🔍</span>
+                <input type="text" value={query} onChange={e => setQuery(e.target.value)}
+                  placeholder="Search columns..." className="form-control pl-7 text-[12px]" />
+              </div>
+              <div className="bg-ge-elevated border border-ge-border rounded-md overflow-y-auto max-h-72">
+                {beLoadingTags ? (
+                  <div className="flex items-center gap-2 px-3 py-6 text-[12px] text-ge-text3">
+                    <Spinner size={13} /> Loading columns from database...
+                  </div>
+                ) : (() => {
+                  const q = query.trim().toLowerCase()
+                  const shown = q
+                    ? beTags.filter(t => t.tag.toLowerCase().includes(q) || t.column_name.toLowerCase().includes(q))
+                    : beTags
+                  if (shown.length === 0) return (
+                    <div className="px-3 py-6 text-center text-[12px] text-ge-text3 italic">
+                      {beTags.length ? `No columns matching "${query}"` : 'No columns found'}
+                    </div>
+                  )
+                  return shown.map(t => {
+                    const isSel = beSelected.includes(t.column_name)
+                    return (
+                      <div key={t.column_name}
+                        onClick={() => { setBeSelected(prev => isSel ? prev.filter(c => c !== t.column_name) : [...prev, t.column_name]); setDirty(true) }}
+                        className={`flex items-center gap-2 px-2.5 py-1.5 cursor-pointer select-none
+                                    border-b border-ge-border last:border-b-0 transition-colors
+                                    hover:bg-ge-surface ${isSel ? 'bg-ge-blue/10' : ''}`}>
+                        <div className={`w-3.5 h-3.5 rounded border flex items-center justify-center text-[9px] flex-shrink-0
+                                        ${isSel ? 'bg-ge-blue border-ge-blue text-white' : 'border-ge-border2'}`}>
+                          {isSel && '✓'}
+                        </div>
+                        <span className="text-[12px] text-ge-text1 flex-1 leading-tight truncate">{t.tag}</span>
+                        {t.unit && <span className="text-[10px] font-mono text-ge-text3">{t.unit}</span>}
+                      </div>
+                    )
+                  })
+                })()}
+              </div>
+            </div>
+          )
+        ) : types.length === 0 ? (
           <div className="py-6 text-center text-[12px] text-ge-text3">
             Select one or more equipment types above to load their columns
           </div>
@@ -604,23 +854,46 @@ export default function Preconfigured() {
                   <button type="button" className="btn btn-outline btn-sm"
                     disabled={locked || !activeTags.length}
                     title={`Select every ${activeType} column`}
-                    onClick={() => setSelected(prev => {
+                    onClick={() => { setSelected(prev => {
                       const have = new Set(prev.map(selKey))
                       const add  = activeTags
                         .map(t => ({ type: activeType, eqId: active.eqId, column: t.column_name,
                                      label: t.tag, unit: t.unit }))
                         .filter(e => !have.has(selKey(e)))
                       return [...prev, ...add]
-                    })}>
+                    }); setDirty(true) }}>
                     ✓ Select All
                   </button>
                   <button type="button" className="btn btn-outline btn-sm"
                     disabled={locked || !selected.some(s => s.type === activeType)}
                     title={`Clear the selected ${activeType} columns`}
-                    onClick={() => setSelected(prev => prev.filter(s => s.type !== activeType))}>
+                    onClick={() => { setSelected(prev => prev.filter(s => s.type !== activeType)); setDirty(true) }}>
                     ✕ Clear
                   </button>
                 </div>
+              </div>
+
+              {/* Equipment identifier for the ACTIVE type. Locked while merely viewing an
+                  opened template (no accidental changes); editable after Edit — switching
+                  the device reloads that type's columns via the existing changeEquipment
+                  handler, and the choice is persisted by Save Changes. */}
+              <div className="mb-2">
+                <label className="block text-[10px] font-semibold uppercase tracking-widest text-ge-text3 mb-1">
+                  {activeType} Equipment
+                </label>
+                <select className="form-control text-[12px]"
+                  value={active.eqId || ''}
+                  disabled={locked || active.loadingEq}
+                  onChange={e => changeEquipment(activeType, e.target.value)}>
+                  {(active.eqList || []).length === 0 && (
+                    <option value="">{active.loadingEq ? 'Loading…' : 'No equipment'}</option>
+                  )}
+                  {(active.eqList || []).map(eq => (
+                    <option key={eq.equipment_id} value={eq.equipment_id}>
+                      {eq.display_name || eq.equipment_id}
+                    </option>
+                  ))}
+                </select>
               </div>
 
               <div className="relative mb-2">
@@ -700,7 +973,7 @@ export default function Preconfigured() {
                         </span>
                         {s.unit && <span className="text-[10px] font-mono text-ge-text3">{s.unit}</span>}
                         <button type="button" title="Remove" disabled={locked}
-                          onClick={() => setSelected(prev => prev.filter(x => selKey(x) !== selKey(s)))}
+                          onClick={() => { setSelected(prev => prev.filter(x => selKey(x) !== selKey(s))); setDirty(true) }}
                           className="px-1 text-[11px] text-ge-text3 hover:text-ge-danger disabled:opacity-40">✕</button>
                       </div>
                     ))}
@@ -740,7 +1013,7 @@ export default function Preconfigured() {
       {/* Report Data */}
       <div className="card">
         <div className="card-title justify-between">
-          <span>📋 Report Data</span>
+          <span>📋 Report Data{viewSource === 'backend' && backendRec ? ` — ${backendRec.name}` : ''}</span>
           {result && (
             <span className="text-[11px] font-mono text-ge-text3">
               {(result.sources || []).length} equipment ·{' '}
@@ -749,6 +1022,25 @@ export default function Preconfigured() {
             </span>
           )}
         </div>
+
+        {/* Saved report configuration summary (backend saved reports only) — the
+            builder controls above can't represent a single-type multi-equipment
+            report, so its configuration is shown read-only here alongside the table. */}
+        {viewSource === 'backend' && backendRec && (
+          <div className="mb-3 flex flex-wrap gap-x-4 gap-y-1 border-b border-ge-border pb-2
+                          text-[11px] text-ge-text3">
+            <span><span className="text-ge-text2">Type:</span> {backendRec.equipment_type}</span>
+            <span><span className="text-ge-text2">Equipment:</span>{' '}
+              {backendRec.equipment_label || (backendRec.equipment_ids || []).join(', ') || '—'}</span>
+            <span><span className="text-ge-text2">Tags:</span>{' '}
+              {backendRec.tag_count ?? (backendRec.tags || []).length}</span>
+            <span><span className="text-ge-text2">Range:</span> {backendRec.date_range || '—'}</span>
+            <span><span className="text-ge-text2">Interval:</span>{' '}
+              {INTERVAL_LABELS[backendRec.interval] || backendRec.interval}</span>
+            <span><span className="text-ge-text2">Aggregation:</span>{' '}
+              {AGG_LABEL[backendRec.agg_function] || backendRec.agg_function}</span>
+          </div>
+        )}
 
         {generating ? (
           <div className="space-y-1">
@@ -786,7 +1078,9 @@ export default function Preconfigured() {
                         <td key={c.key} className="font-mono text-[11px] whitespace-nowrap">
                           {c.isTs
                             ? <span className="text-ge-text3">{fmtTimestamp(row[c.key])}</span>
-                            : <span className="text-ge-accent">{fmtCell(row[c.key])}</span>}
+                            : c.isEq
+                              ? <span className="text-ge-text2">{row[c.key]}</span>
+                              : <span className="text-ge-accent">{fmtCell(row[c.key])}</span>}
                         </td>
                       ))}
                     </tr>
@@ -799,18 +1093,23 @@ export default function Preconfigured() {
               <label className="text-[11px] font-mono text-ge-text3 flex items-center gap-1.5">
                 Rows/page
                 <select value={pageSize} disabled={generating}
-                  onChange={e => runReport(1, Number(e.target.value))}
+                  onChange={e => {
+                    const s = Number(e.target.value)
+                    return viewSource === 'backend' ? loadBackendPage(backendRec, 1, s) : runReport(1, s)
+                  }}
                   className="bg-ge-elevated border border-ge-border rounded px-1.5 py-1
                              text-[11px] text-ge-text1 disabled:opacity-40">
                   {PAGE_SIZES.map(s => <option key={s} value={s}>{s}</option>)}
                 </select>
               </label>
-              <button onClick={() => runReport(page - 1, pageSize)}
+              <button onClick={() => viewSource === 'backend'
+                  ? loadBackendPage(backendRec, page - 1, pageSize) : runReport(page - 1, pageSize)}
                 disabled={page <= 1 || generating}
                 className="px-2.5 py-1 text-[11px] font-mono rounded border
                            bg-ge-elevated border-ge-border text-ge-text2
                            hover:text-ge-text1 disabled:opacity-40">◀ Prev</button>
-              <button onClick={() => runReport(page + 1, pageSize)}
+              <button onClick={() => viewSource === 'backend'
+                  ? loadBackendPage(backendRec, page + 1, pageSize) : runReport(page + 1, pageSize)}
                 disabled={page >= totalPages || generating}
                 className="px-2.5 py-1 text-[11px] font-mono rounded border
                            bg-ge-elevated border-ge-border text-ge-text2

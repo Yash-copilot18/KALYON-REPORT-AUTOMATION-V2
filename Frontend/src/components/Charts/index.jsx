@@ -3,9 +3,15 @@ import React from 'react'
 import {
   LineChart, Line, BarChart, Bar, AreaChart, Area,
   ScatterChart, Scatter, XAxis, YAxis, CartesianGrid,
-  Tooltip, Legend, ResponsiveContainer, ReferenceLine, Cell,
+  Tooltip, Legend, ResponsiveContainer, ReferenceLine, Cell, LabelList,
 } from 'recharts'
 import { RECHARTS_COLORS as C } from '../../utils/helpers'
+import { columnValueLabel, domainMax, CHART_LABEL_COLOR } from '../../utils/chartValueLabel'
+
+// Bar-chart axis ticks use the same bright, readable label colour as the bar value labels
+// so all chart text is clearly legible on the dark background (client request). Line/area/
+// scatter charts keep their existing muted ticks.
+const BAR_TICK = { fill: CHART_LABEL_COLOR, fontSize: 10 }
 
 const TOOLTIP_STYLE = {
   backgroundColor: '#1a2035',
@@ -57,14 +63,18 @@ export function PowerTrendChart({ data }) {
 export function DailyEnergyChart({ data }) {
   return (
     <ResponsiveContainer width="100%" height="100%">
-      <BarChart data={data} margin={{ top: 4, right: 8, left: -16, bottom: 0 }}>
+      <BarChart data={data} margin={{ top: 10, right: 8, left: -16, bottom: 0 }}>
         <CartesianGrid strokeDasharray="3 3" stroke={C.grid} vertical={false} />
-        <XAxis dataKey="label" tick={{ fill: C.text3, fontSize: 10 }} axisLine={false} tickLine={false} />
-        <YAxis tick={{ fill: C.text3, fontSize: 10 }} axisLine={false} tickLine={false}
+        <XAxis dataKey="label" tick={BAR_TICK} axisLine={false} tickLine={false} />
+        <YAxis tick={BAR_TICK} axisLine={false} tickLine={false}
+               domain={[0, domainMax(data, 'value', 1.5)]}
                tickFormatter={v => (v >= 1000 ? (v / 1000).toFixed(1) + 'k' : Math.round(v).toLocaleString())} />
         <Tooltip content={<CustomTooltip unit=" MWh" />} />
+        {/* Permanent value label on every day's bar (visible without hovering). */}
         <Bar dataKey="value" name="Energy" fill={C.blue} radius={[3,3,0,0]}
-             fillOpacity={0.85} />
+             fillOpacity={0.85} isAnimationActive={false}>
+          <LabelList dataKey="value" content={columnValueLabel({ unit: 'MWh', barCount: data?.length || 0 })} />
+        </Bar>
       </BarChart>
     </ResponsiveContainer>
   )
@@ -127,9 +137,9 @@ export function InverterComparisonChart({ data }) {
     <ResponsiveContainer width="100%" height="100%">
       <BarChart data={data} layout="vertical" margin={{ top: 4, right: 24, left: 20, bottom: 0 }}>
         <CartesianGrid strokeDasharray="3 3" stroke={C.grid} horizontal={false} />
-        <XAxis type="number" tick={{ fill: C.text3, fontSize: 10 }} axisLine={false} tickLine={false}
+        <XAxis type="number" tick={BAR_TICK} axisLine={false} tickLine={false}
                tickFormatter={v => `${v}MW`} />
-        <YAxis type="category" dataKey="id" tick={{ fill: '#a0aec0', fontSize: 11 }}
+        <YAxis type="category" dataKey="id" tick={{ ...BAR_TICK, fontSize: 11 }}
                axisLine={false} tickLine={false} />
         <Tooltip content={<CustomTooltip unit=" MW" />} />
         <Bar dataKey="power" name="Output" fill={C.blue} radius={[0,3,3,0]} fillOpacity={0.85} />
@@ -166,18 +176,21 @@ export function WeeklyEnergyChart({ data }) {
 export function MonthlyEnergyChart({ data, currentMonth = 0 }) {
   return (
     <ResponsiveContainer width="100%" height="100%">
-      <BarChart data={data} margin={{ top: 4, right: 8, left: -16, bottom: 0 }}>
+      <BarChart data={data} margin={{ top: 10, right: 8, left: -16, bottom: 0 }}>
         <CartesianGrid strokeDasharray="3 3" stroke={C.grid} vertical={false} />
-        <XAxis dataKey="label" tick={{ fill: C.text3, fontSize: 10 }} axisLine={false} tickLine={false} />
-        <YAxis tick={{ fill: C.text3, fontSize: 10 }} axisLine={false} tickLine={false}
+        <XAxis dataKey="label" tick={BAR_TICK} axisLine={false} tickLine={false} />
+        <YAxis tick={BAR_TICK} axisLine={false} tickLine={false}
+               domain={[0, domainMax(data, 'value', 1.5)]}
                tickFormatter={v => (v >= 1000 ? (v / 1000).toFixed(1) + 'k' : Math.round(v).toLocaleString())} />
         <Tooltip content={<CustomTooltip unit=" MWh" />} cursor={{ fill: 'rgba(255,255,255,0.04)' }} />
-        <Bar dataKey="value" name="Energy" radius={[4, 4, 0, 0]}>
+        <Bar dataKey="value" name="Energy" radius={[4, 4, 0, 0]} isAnimationActive={false}>
           {data.map((d, i) => (
             // Highlight the current production month (brighter blue), others accent.
             <Cell key={i} fill={d.month === currentMonth ? C.blue : C.accent}
                   fillOpacity={d.month === currentMonth ? 1 : 0.7} />
           ))}
+          {/* Permanent value label on every month's bar (visible without hovering). */}
+          <LabelList dataKey="value" content={columnValueLabel({ unit: 'MWh', barCount: data?.length || 0 })} />
         </Bar>
       </BarChart>
     </ResponsiveContainer>

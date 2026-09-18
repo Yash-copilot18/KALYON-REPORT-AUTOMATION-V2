@@ -10,6 +10,7 @@ from app.models.reports import (
     TemperatureReport,
 )
 from app.models.schedules import ReportSchedule, ScheduleRun
+from app.models.saved_reports import SavedReport
 
 __all__ = [
     "Equipment",
@@ -23,4 +24,5 @@ __all__ = [
     "TemperatureReport",
     "ReportSchedule",
     "ScheduleRun",
+    "SavedReport",
 ]

@@ -24,7 +24,7 @@ Endpoints:
 
 import logging
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
@@ -65,7 +65,10 @@ class SchedulePayload(BaseModel):
     freq:       str = "Daily"
     time:       Optional[str] = None       # HH:MM scheduled execution time (default 20:30)
     status:     Optional[str] = None
-    recipients: Optional[str] = None
+    # One or more destination addresses. Accepts a list (the multi-recipient UI) or a
+    # comma/semicolon-separated string (the original single-recipient form and any
+    # existing API client), so both callers keep working.
+    recipients: Optional[Union[str, List[str]]] = None
 
     model_config = {"populate_by_name": True}
 
@@ -148,20 +151,48 @@ def list_schedules(db: Session = Depends(get_db)) -> List[Dict]:
 
 
 def _validate_type(eq_type: str) -> None:
-    """Scheduled Reports supports ONLY DGR / MGR / YGR."""
+    """A report type is required; every supported equipment/report type is schedulable."""
     if not (eq_type or "").strip():
         raise HTTPException(400, detail="Report type is required")
     if not schedule_service.is_supported_type(eq_type):
-        raise HTTPException(
-            400,
-            detail=("Unsupported report type. Scheduled Reports supports only "
-                    + ", ".join(schedule_service.SUPPORTED_REPORT_TYPES) + "."),
-        )
+        raise HTTPException(400, detail="Unsupported report type.")
+
+
+def _validate_recipients(payload: SchedulePayload) -> None:
+    """
+    Reject the request if ANY supplied address is malformed, naming the offenders so
+    the UI can show exactly which one to fix. An omitted/empty list is fine — the
+    schedule then falls back to the configured recipient. Duplicates are not an error
+    here: they are collapsed case-insensitively when normalised for storage.
+    """
+    if payload.recipients is None:
+        return
+    bad = schedule_service.invalid_recipients(payload.recipients)
+    if bad:
+        raise HTTPException(400, detail="Invalid e-mail address: " + ", ".join(bad))
+
+
+def _require_email_config() -> None:
+    """
+    Refuse to put a schedule into the ACTIVE state while SMTP is unconfigured, so the
+    problem surfaces the moment the user creates/enables it instead of silently
+    failing at the scheduled hour. Only the missing VARIABLE NAMES are returned —
+    never a value. Creating a Paused schedule is still allowed.
+    """
+    missing = email_service.get_missing_config()
+    if missing:
+        raise HTTPException(400, detail=(
+            "E-mail is not configured, so this schedule could not send its report. "
+            "Set " + ", ".join(missing) + " in Backend/.env (see EMAIL_SETUP.md) and "
+            "restart the backend."))
 
 
 @router.post("/schedules")
 def create_schedule(payload: SchedulePayload, db: Session = Depends(get_db)) -> Dict:
     _validate_type(payload.eq_type)
+    _validate_recipients(payload)
+    if (payload.status or "Active").strip().lower() != "paused":
+        _require_email_config()
     s = schedule_service.create_schedule(db, payload.as_dict())
     return _row(db, s)
 
@@ -171,6 +202,7 @@ def update_schedule(schedule_id: int, payload: SchedulePayload,
                     db: Session = Depends(get_db)) -> Dict:
     if payload.eq_type:
         _validate_type(payload.eq_type)
+    _validate_recipients(payload)
     s = schedule_service.update_schedule(db, schedule_id, payload.as_dict())
     if not s:
         raise HTTPException(404, detail="Schedule not found")
@@ -202,6 +234,7 @@ def pause_schedule(schedule_id: int, db: Session = Depends(get_db)) -> Dict:
 
 @router.post("/schedules/{schedule_id}/resume")
 def resume_schedule(schedule_id: int, db: Session = Depends(get_db)) -> Dict:
+    _require_email_config()          # enabling is the other moment to surface this
     s = schedule_service.set_status(db, schedule_id, "Active")
     if not s:
         raise HTTPException(404, detail="Schedule not found")

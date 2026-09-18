@@ -21,6 +21,17 @@ INSTANT_INTERVALS = frozenset({"raw", "1min"})
 # Aggregation applied to every non-instant interval unless the caller picks another.
 DEFAULT_AGG = "avg"
 
+# Full-word labels for the report metadata "Aggregation" row (e.g. avg → "Average"),
+# so exports read "Average" rather than the terse code "AVG".
+_AGG_FULL = {"avg": "Average", "min": "Minimum", "max": "Maximum", "sum": "Sum"}
+
+
+def agg_word(agg: Any) -> str:
+    """Full-word label for a raw aggregation code (avg → 'Average'); upper-cased passthrough otherwise."""
+    code = (getattr(agg, "value", agg) or "")
+    code = str(code).lower()
+    return _AGG_FULL.get(code, str(code).upper())
+
 
 def norm(interval: Any) -> str:
     """Accept a str or an IntervalEnum and return the plain interval string."""
@@ -42,7 +53,7 @@ def effective_agg(interval: Any, agg: Any = None) -> Optional[str]:
 def agg_label(interval: Any, agg: Any = None) -> str:
     """Human-readable aggregation for report metadata (CSV/Excel headers)."""
     resolved = effective_agg(interval, agg)
-    return "Not applicable (instant data)" if resolved is None else resolved.upper()
+    return "Not applicable (instant data)" if resolved is None else agg_word(resolved)
 
 
 def interval_label(interval: Any) -> str:

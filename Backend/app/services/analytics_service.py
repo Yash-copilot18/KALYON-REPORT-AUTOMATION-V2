@@ -68,8 +68,32 @@ def _num(v) -> float:
     return float(v) if v is not None else 0.0
 
 
+def _inverter_peak_mw(db: Session, inverter_id: str, from_d, to_d) -> Optional[float]:
+    """Peak active power (MW) for ONE inverter over the range, from [dbo].[POWER_GRAPH]
+    (INVERTER_xx_ACTIVE_POWER, stored in kW → MW). Returns None if the table/column is
+    absent so the KPI degrades gracefully. `inverter_id` is already validated against the
+    real INVERTER_DAILY_GEN columns by the caller, and the column's existence is checked
+    here (parameterised) before it is used, so the interpolation is safe."""
+    col = f"{inverter_id}_ACTIVE_POWER"
+    try:
+        exists = db.execute(text(
+            "SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS "
+            "WHERE TABLE_NAME = 'POWER_GRAPH' AND COLUMN_NAME = :c"
+        ), {"c": col}).scalar()
+        if not exists:
+            return None
+        v = db.execute(text(
+            f"SELECT MAX(CAST([{col}] AS FLOAT)) FROM [dbo].[POWER_GRAPH] "
+            "WHERE CAST(TimeCol AS DATE) BETWEEN :a AND :b"
+        ), {"a": from_d, "b": to_d}).scalar()
+        return round(_num(v) / 1000.0, 1) if v is not None else None
+    except Exception:                                   # never let a missing source 500 the page
+        return None
+
+
 def get_overview(db: Session, from_str: Optional[str], to_str: Optional[str],
-                 equipment: Optional[str] = None) -> Dict[str, Any]:
+                 equipment: Optional[str] = None,
+                 equipment_ids: Optional[str] = None) -> Dict[str, Any]:
     latest = _latest_ppc_date(db)
     to_d = _parse(to_str, latest)
     from_d = _parse(from_str, to_d - timedelta(days=29))
@@ -174,12 +198,35 @@ def get_overview(db: Session, from_str: Optional[str], to_str: Optional[str],
         for rank, inv in enumerate(inverters, start=1):
             inv["rank"] = rank
 
-    equipment_options = ["all"] + [inv["inverter"] for inv in
-                                   sorted(inverters, key=lambda x: x["inverter"])]
-    selected = equipment if equipment and equipment != "all" else "all"
-    ranked = inverters if selected == "all" else [i for i in inverters if i["inverter"] == selected]
+    # Every real inverter (stable order), used for the checkbox list AND to detect the
+    # "all selected" case — derived from the schema so the list is complete even when the
+    # chosen range has no telemetry.
+    all_ids = [c[: -len("_GEN")] for c in gen_cols]
+    equipment_options = ["all"] + sorted(all_ids)
+
+    # ── Resolve the inverter selection (checkbox multi-select) ───────────────────
+    # `equipment_ids` (comma-separated) drives the multi-select and takes precedence;
+    # `equipment` (single id) is kept for backward-compatibility.
+    #   · param absent               → ALL inverters (plant-level view)
+    #   · list == every inverter     → ALL inverters (plant-level view)
+    #   · non-empty subset           → recompute from ONLY those inverters
+    #   · present but empty          → nothing selected → empty analytics
+    none_selected = False
+    if equipment_ids is not None:
+        req = [s.strip() for s in equipment_ids.split(",") if s.strip()]
+        sel_ids = [i for i in req if i in all_ids]
+        none_selected = (len(sel_ids) == 0)
+        is_all = (not none_selected) and len(sel_ids) == len(all_ids)
+    elif equipment and equipment != "all":
+        sel_ids = [equipment] if equipment in all_ids else []
+        none_selected = (len(sel_ids) == 0)
+        is_all = False
+    else:
+        sel_ids, is_all = list(all_ids), True
+    sel_set = set(sel_ids)
 
     ndays = len(plant_rows) or 1
+    # Plant-level KPIs — the ALL-inverters (or default) view.
     kpis = {
         "today_energy":  {"label": "Latest Day Energy", "value": round(daily[-1]["generation_mwh"], 1) if daily else None, "unit": "MWh"},
         "period_energy": {"label": "Period Energy",      "value": round(total_energy, 1) if daily else None, "unit": "MWh"},
@@ -188,11 +235,76 @@ def get_overview(db: Session, from_str: Optional[str], to_str: Optional[str],
         "availability":  {"label": "Plant Availability", "value": availability_pct, "unit": "%"},
         "peak_power":    {"label": "Peak Power",         "value": round(peak_power, 1) if daily else None, "unit": "MW"},
     }
+    ranked = inverters                      # ALL view: full ranking
+    selected_label = "all"
 
-    logger.info("Analytics overview | %s→%s | days=%d | inverters=%d | equip=%s | "
+    if none_selected:
+        # No inverter checked → every chart/table empty, KPIs null (the UI shows its
+        # "No Data Available" states instead of any plant/aggregate figures).
+        daily, monthly, pr_trend, ranked = [], [], [], []
+        kpis = {k: {"label": v["label"], "value": None, "unit": v["unit"]} for k, v in kpis.items()}
+        selected_label = "none"
+
+    elif not is_all:
+        # ── SUBSET view — recompute generation / PR / KPIs from ONLY the selected
+        # inverters (the ALL path above stays the plant-level combined view). Uses the
+        # already-fetched per-day per-inverter rows (inv_rows); the only extra query is
+        # each selected inverter's peak power from POWER_GRAPH. Generation kWh → MWh so
+        # the existing (MWh) charts/axes hold. This generalises the former single-inverter
+        # path to any subset (a subset of 1 behaves exactly as before).
+        ranked = [i for i in inverters if i["inverter"] in sel_set]
+        selected_label = sel_ids[0] if len(sel_ids) == 1 else "multiple"
+        sel_cols = [c for c in gen_cols if c[: -len("_GEN")] in sel_set]
+        if sel_cols and inv_rows:
+            idxs = [gen_cols.index(c) + 1 for c in sel_cols]     # +1: row[0] is the date
+            n_sel = len(sel_cols)
+            per_inv_cap_kw = (cap_mw * 1000) / len(gen_cols)
+            subset_cap_kw = per_inv_cap_kw * n_sel               # selected share of capacity
+            i_daily, i_pr_trend, i_monthly_acc, i_avail = [], [], {}, []
+            i_total_kwh, i_pr_values = 0.0, []
+            for row in inv_rows:
+                d = row[0]
+                day_kwh   = sum(max(0.0, _num(row[j])) for j in idxs)
+                producing = sum(1 for j in idxs if _num(row[j]) > 0)
+                i_total_kwh += day_kwh
+                i_avail.append(producing / n_sel * 100)
+                mwh = day_kwh / 1000.0
+                h = insol.get(d, 0.0)
+                pr = (min(round((day_kwh / subset_cap_kw) / h * 100, 1), 100.0)
+                      if h > 0 and day_kwh > 0 else None)
+                if pr is not None:
+                    i_pr_values.append(pr)
+                label = d.strftime("%d/%m")
+                i_daily.append({"date": d.isoformat(), "label": label, "generation_mwh": round(mwh, 3)})
+                i_pr_trend.append({"date": d.isoformat(), "label": label, "pr": pr})
+                ym = d.strftime("%Y-%m")
+                i_monthly_acc[ym] = i_monthly_acc.get(ym, 0.0) + mwh
+            i_ndays = len(inv_rows) or 1
+            peaks = [_inverter_peak_mw(db, sid, from_d, to_d) for sid in sel_ids]
+            peak_val = (round(sum(p for p in peaks if p is not None), 1)
+                        if any(p is not None for p in peaks) else None)
+
+            daily = i_daily
+            pr_trend = i_pr_trend
+            monthly = [{"ym": ym, "label": f"{_MONTHS[int(ym[5:7]) - 1]} {ym[:4]}",
+                        "generation_mwh": round(v, 3)} for ym, v in sorted(i_monthly_acc.items())]
+            kpis = {
+                "today_energy":  {"label": "Latest Day Energy", "value": i_daily[-1]["generation_mwh"] if i_daily else None, "unit": "MWh"},
+                "period_energy": {"label": "Period Energy",      "value": round(i_total_kwh / 1000.0, 3) if i_daily else None, "unit": "MWh"},
+                "avg_pr":        {"label": "Average PR",         "value": round(sum(i_pr_values) / len(i_pr_values), 1) if i_pr_values else None, "unit": "%"},
+                "avg_cuf":       {"label": "Average CUF",        "value": round(i_total_kwh / (subset_cap_kw * 24 * i_ndays) * 100, 1) if i_daily else None, "unit": "%"},
+                "availability":  {"label": "Plant Availability", "value": round(sum(i_avail) / len(i_avail), 1) if i_avail else None, "unit": "%"},
+                "peak_power":    {"label": "Peak Power",         "value": peak_val, "unit": "MW"},
+            }
+        else:
+            # A valid subset but the range has no inverter telemetry → empty, not zeros.
+            daily, monthly, pr_trend = [], [], []
+            kpis = {k: {"label": v["label"], "value": None, "unit": v["unit"]} for k, v in kpis.items()}
+
+    logger.info("Analytics overview | %s→%s | days=%d | inverters=%d | selected=%d/%d (%s) | "
                 "energy=%.0f MWh | peak=%.1f MW | avgPR=%s",
-                from_d, to_d, ndays, len(inverters), selected, total_energy, peak_power,
-                kpis["avg_pr"]["value"])
+                from_d, to_d, ndays, len(inverters), len(sel_ids), len(all_ids), selected_label,
+                total_energy, peak_power, kpis["avg_pr"]["value"])
 
     return {
         "range": {"from": from_d.isoformat(), "to": to_d.isoformat()},
@@ -203,5 +315,6 @@ def get_overview(db: Session, from_str: Optional[str], to_str: Optional[str],
         "pr_trend": pr_trend,
         "inverters": ranked,
         "equipment_options": equipment_options,
-        "selected_equipment": selected,
+        "selected_equipment": selected_label,
+        "selected_equipment_ids": sel_ids,
     }

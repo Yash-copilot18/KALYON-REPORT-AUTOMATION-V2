@@ -68,12 +68,25 @@ export function AsyncButton({ onClick, children, className = 'btn btn-outline bt
 }
 
 // ── Data Table ────────────────────────────────────────────────────────────────
-export function DataTable({ columns, rows, emptyMsg = 'No data' }) {
+// Map a column's `align` to a Tailwind text-align class. Applied to the HEADER and the
+// DATA cells identically, so a column's header always lines up with its values (the
+// `<th>` used to be left-aligned while numeric `<td>`s were right-aligned → misaligned).
+const alignClass = a => (a === 'center' ? 'text-center' : a === 'right' ? 'text-right'
+  : a === 'left' ? 'text-left' : '')
+
+// `fixed` → table-layout:fixed, so columns split the FULL container width by their
+// declared `width` (or evenly) instead of hugging their content and leaving the table
+// looking left-shifted. Off by default, so existing callers are unchanged.
+export function DataTable({ columns, rows, emptyMsg = 'No data', fixed = false }) {
   return (
     <div className="overflow-x-auto">
-      <table className="data-table">
+      <table className={`data-table${fixed ? ' table-fixed' : ''}`}>
         <thead>
-          <tr>{columns.map(c => <th key={c.key}>{c.label}</th>)}</tr>
+          <tr>{columns.map(c => (
+            // Header uses the SAME alignment + width as its data column (req 1 & 7).
+            <th key={c.key} className={alignClass(c.align)}
+              style={c.width ? { width: c.width } : undefined}>{c.label}</th>
+          ))}</tr>
         </thead>
         <tbody>
           {rows.length === 0
@@ -81,7 +94,8 @@ export function DataTable({ columns, rows, emptyMsg = 'No data' }) {
             : rows.map((row, i) => (
               <tr key={i}>
                 {columns.map(c => (
-                  <td key={c.key} className={c.className || ''}>
+                  <td key={c.key} className={`${alignClass(c.align)} ${c.className || ''}`.trim()}
+                    style={c.width ? { width: c.width } : undefined}>
                     {c.render ? c.render(row[c.key], row) : row[c.key]}
                   </td>
                 ))}

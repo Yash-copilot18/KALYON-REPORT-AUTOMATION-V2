@@ -93,17 +93,30 @@ async def lifespan(app: FastAPI):
 
 
 # ── App Instance ──────────────────────────────────────────────────────────────
+# Interactive API docs are a development aid: they enumerate every route and schema,
+# which is reconnaissance for anyone who can reach the host. They stay ON by default so
+# nothing changes for local work, and switch OFF when ENV=production (or by setting
+# ENABLE_API_DOCS=false explicitly).
+# APP_ENV is the name the shipped .env.example already documents; ENV is accepted as a
+# fallback so either spelling works rather than introducing a competing variable.
+_env = (os.getenv("APP_ENV") or os.getenv("ENV") or "development").strip().lower()
+_docs_default = "false" if _env in ("production", "prod") else "true"
+ENABLE_API_DOCS = os.getenv("ENABLE_API_DOCS", _docs_default).strip().lower() in ("1", "true", "yes")
+
 app = FastAPI(
     title="GE Solar Monitoring API",
+    # This description is public whenever the docs are served, so it carries NO
+    # infrastructure detail. The database server/name and auth mode were listed here —
+    # that told an unauthenticated caller exactly what to attack. Those values live in
+    # the environment and are logged server-side at startup instead.
     description=(
-        "Production-ready FastAPI backend for GE Vernova Solar Power Plant "
-        "Monitoring and Report Automation System.\n\n"
-        "Connected to: **SERVICESCADA32\\SQLEXPRESS** · "
-        "Database: **Kalyan** · Auth: **Windows Authentication**"
+        "FastAPI backend for the Solar Power Plant Monitoring and "
+        "Report Automation System."
     ),
     version="1.0.0",
-    docs_url="/docs",
-    redoc_url="/redoc",
+    docs_url="/docs" if ENABLE_API_DOCS else None,
+    redoc_url="/redoc" if ENABLE_API_DOCS else None,
+    openapi_url="/openapi.json" if ENABLE_API_DOCS else None,
     lifespan=lifespan,
 )
 
@@ -113,7 +126,17 @@ cors_origins_raw = os.getenv(
     "CORS_ORIGINS",
     "http://localhost:5173,http://localhost:3000"
 )
-cors_origins = [o.strip() for o in cors_origins_raw.split(",")]
+cors_origins = [o.strip() for o in cors_origins_raw.split(",") if o.strip()]
+
+# A wildcard origin combined with allow_credentials is rejected by browsers and, worse,
+# invites a deployment that believes it is locked down when it is not. Fail loudly at
+# startup instead of serving a permissive policy: list the real origins in CORS_ORIGINS.
+if "*" in cors_origins:
+    raise RuntimeError(
+        "CORS_ORIGINS must list explicit origins — '*' cannot be combined with "
+        "credentialed requests. Set CORS_ORIGINS to the exact frontend URL(s)."
+    )
+logger.info("CORS allowed origins: %s", cors_origins)
 
 app.add_middleware(
     CORSMiddleware,
@@ -171,6 +194,7 @@ from app.routers import (
     scheduled,
     tracker,
     isolator,
+    saved_reports,
 )
 
 app.include_router(health.router)
@@ -183,6 +207,7 @@ app.include_router(reports_v2.router,     prefix="/api/v1")
 app.include_router(scheduled.router,      prefix="/api/v1")
 app.include_router(tracker.router,        prefix="/api/v1")
 app.include_router(isolator.router,       prefix="/api/v1")
+app.include_router(saved_reports.router,  prefix="/api/v1")
 
 
 # ── Root ──────────────────────────────────────────────────────────────────────

@@ -52,6 +52,44 @@ def is_isolator_table(table: str) -> bool:
     return bool(table) and _safe_name(table) and bool(_TABLE_RE.match(table))
 
 
+# The operator-facing report types whose columns carry the per-device _ID<n> suffix.
+# Anything NOT in this set (Inverter, WMS, PPC, Alarms, MFM, String Combiner, …) keeps
+# its own column order untouched.
+ISOLATION_EQUIPMENT_TYPES = frozenset({"Tracker", "T1 Isolation", "T2 Isolation"})
+
+# Same shape as _ID_RE but tolerant of casing, for ordering caller-supplied tag lists.
+ID_COL_RE = re.compile(r"^(.*)_ID(\d+)$", re.IGNORECASE)
+
+
+def order_columns_by_id(cols: Iterable[str]) -> List[str]:
+    """
+    THE single column order for every isolator/Tracker output — the Excel export and
+    the Report Data table both call this, so the UI can never drift from the workbook.
+
+    Columns are grouped BY DEVICE Id first, Ids ascending, and within one Id the tags
+    follow the canonical parameter order (ALARM, BATTERY_LEVEL, ELEVATION_POSITION,
+    ELEVATION_SETPOINT, MAX_MOTOR_CURRENT, OPERATION_MODE, … — alphabetical by prefix,
+    which is the order PARAMS declares):
+
+        ALARM_ID1, BATTERY_LEVEL_ID1, … OPERATION_MODE_ID1,
+        ALARM_ID2, BATTERY_LEVEL_ID2, … OPERATION_MODE_ID2, …
+
+    NOT tag-first (ALARM_ID1 … ALARM_ID40, BATTERY_LEVEL_ID1 …).
+
+    The Ids and tags are read from the column NAMES themselves, so the grouping is
+    driven entirely by the live schema — no hardcoded tag list, no device-count limit.
+    Only the columns passed in are ordered: a tag missing for some Id simply leaves no
+    gap. Any column without an _ID<n> suffix keeps its relative order and is placed
+    after the Id-grouped ones (the caller adds `timestamp` as the first column).
+    """
+    def key(c: str):
+        m = ID_COL_RE.match(c)
+        if m:
+            return (0, int(m.group(2)), m.group(1).upper())
+        return (1, 0, "")          # non-Id columns last; stable sort keeps their order
+    return sorted(cols, key=key)
+
+
 def id_label(tid: int) -> str:
     """1 → 'IS01', 126 → 'IS126' (min two digits)."""
     return f"IS{tid:02d}"

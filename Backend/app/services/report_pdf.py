@@ -23,12 +23,14 @@ reportlab is the only dependency (already installed in the backend venv).
 
 import io
 import logging
+from datetime import datetime
 
 from reportlab.lib import colors
 from reportlab.lib.enums import TA_LEFT
 from reportlab.lib.pagesizes import A4, landscape
 from reportlab.lib.styles import ParagraphStyle
 from reportlab.lib.units import mm
+from reportlab.pdfgen import canvas as _canvas
 from reportlab.platypus import (
     Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle,
 )
@@ -62,6 +64,49 @@ _MAX_ROWS = 5000
 _GRAY_HDR = colors.HexColor("#F2F2F2")
 _ODD_BG   = colors.HexColor("#FAFAFA")
 _BLACK    = colors.HexColor("#000000")
+
+
+_FOOT_RULE = colors.HexColor("#D2D9E4")
+_FOOT_INK  = colors.HexColor("#6B7A99")
+
+
+class _NumberedCanvas(_canvas.Canvas):
+    """
+    Stamps a footer — generated time · company · "Page X of Y" — on EVERY page (req 5),
+    while the report header stays on page 1 only (the title/metadata are ordinary
+    flowables and are never repeated). The total page count is only known once the whole
+    document is laid out, so pages are buffered and the footer is drawn in a second pass.
+    The report's flowable content (tables/data) is completely untouched.
+    """
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._saved = []
+
+    def showPage(self):
+        self._saved.append(dict(self.__dict__))
+        self._startPage()
+
+    def save(self):
+        total = len(self._saved)
+        for state in self._saved:
+            self.__dict__.update(state)
+            self._draw_footer(total)
+            super().showPage()
+        super().save()
+
+    def _draw_footer(self, total):
+        w, _h = landscape(A4)
+        self.saveState()
+        self.setStrokeColor(_FOOT_RULE)
+        self.setLineWidth(0.6)
+        self.line(_MARGIN, 10 * mm, w - _MARGIN, 10 * mm)
+        self.setFont("Helvetica", 8)
+        self.setFillColor(_FOOT_INK)
+        y = 10 * mm - 9
+        self.drawString(_MARGIN, y, f"Generated {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}")
+        self.drawCentredString(w / 2, y, "Kalyon Solar Monitoring — Report Automation")
+        self.drawRightString(w - _MARGIN, y, f"Page {self._pageNumber} of {total}")
+        self.restoreState()
 
 
 def _cell_text(col, val) -> str:
@@ -110,10 +155,11 @@ def _panel_table(group, rows, hf):
         ("FONT",        (0, 1), (-1, -1), _BODY_FONT, _BODY_SIZE),
         ("TEXTCOLOR",   (0, 0), (-1, -1), _BLACK),
         ("BACKGROUND",  (0, 0), (-1, 0), _GRAY_HDR),
-        ("ALIGN",       (0, 0), (-1, 0), "CENTER"),
         ("VALIGN",      (0, 0), (-1, -1), "MIDDLE"),
-        ("ALIGN",       (1, 1), (-1, -1), "RIGHT"),    # numeric data right-aligned
-        ("ALIGN",       (0, 1), (0, -1), "LEFT"),      # key column left-aligned
+        # Alignment applied to header + data TOGETHER per column, so each header sits
+        # directly above its values: key (first) column left, numeric columns centred.
+        ("ALIGN",       (0, 0), (0, -1), "LEFT"),      # key column: header + data left
+        ("ALIGN",       (1, 0), (-1, -1), "CENTER"),   # numeric columns: header + data centred (req 1 & 2)
         ("GRID",        (0, 0), (-1, -1), 0.4, _BLACK),
         ("TOPPADDING",  (0, 0), (-1, -1), 2),
         ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
@@ -203,7 +249,9 @@ def build_pdf_report(title, sections, *, metadata=None) -> bytes:
             story.append(Paragraph(_escape(subtitle), _SUB_PARA))
         _append_table(story, columns, rows, header_fn or column_header)
 
-    doc.build(story)
+    # Header/metadata are flowables → page 1 only (never repeated). The numbered
+    # canvas adds the footer + "Page X of Y" to every page (req 5).
+    doc.build(story, canvasmaker=_NumberedCanvas)
     buf.seek(0)
     return buf.getvalue()
 

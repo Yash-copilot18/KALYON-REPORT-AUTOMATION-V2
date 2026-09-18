@@ -111,13 +111,14 @@ def col_header(col: str) -> str:
 def display_equipment_id(equipment_type: str, equipment_id) -> str:
     """
     PRESENTATION-only equipment name for user-facing text (CSV metadata, filenames).
-    The merged "Tracker" type shows Tracker{n}; every other type is unchanged. The real
-    equipment_id (the table name) is never modified — this only affects what is shown.
+    The merged "Tracker" type shows the client identifier IS{nn} (IS01, IS02, … IS24 —
+    two digits, leading zero); every other type is unchanged. The real equipment_id (the
+    table name) is never modified — this only affects what is shown.
     """
     if equipment_type == "Tracker":
         m = re.match(r"^T\d+_IS0*(\d+)$", str(equipment_id or ""), re.IGNORECASE)
         if m:
-            return f"Tracker{m.group(1)}"
+            return f"IS{int(m.group(1)):02d}"
     return equipment_id
 
 
@@ -224,6 +225,22 @@ def get_equipment_types(db: Session = Depends(get_db)):
 @router.get("/equipment-list")
 def get_equipment_list(type: str = Query(...), db: Session = Depends(get_db)):
     return ReportsService.get_equipment_list(db, type)
+
+
+@router.get("/wms-columns", summary="WMS table columns in exact database (ordinal) order")
+def get_wms_columns(db: Session = Depends(get_db)):
+    """
+    Return every WMS column name in the EXACT database order (ORDINAL_POSITION), so the
+    DGR page's WMS table is data-driven from the real schema — the client's SQL SELECT
+    list is the source of truth for names and order. Read-only metadata lookup; it does
+    not touch or change any existing report query or values.
+    """
+    from sqlalchemy import text
+    rows = db.execute(text(
+        "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS "
+        "WHERE TABLE_NAME = 'WMS' ORDER BY ORDINAL_POSITION"
+    )).fetchall()
+    return {"columns": [r[0] for r in rows]}
 
 
 @router.get("/mgr/periods", summary="Year/month combinations that carry generation data")
@@ -599,17 +616,18 @@ def export_download(job_id: str):
     )
 
 
-# ── Direct-to-Downloads export (T1/T2 Isolation) — no ZIP ──────────────────────
-# Each device report is built in parallel (ProcessPool) and written straight to the
-# user's Downloads folder the moment it finishes. Progress is reported over the same
-# SSE endpoint (/export/progress/{job_id}); there is no file to download afterwards.
+# ── Direct-to-Reports export (ALL equipment types) — no ZIP ────────────────────
+# Every report is written straight to disk under the single Reports root, in its own
+# per-type subfolder (Downloads\Reports\<Equipment Type>\...). Progress is reported over
+# the same SSE endpoint (/export/progress/{job_id}); there is no file to download after.
 @router.post("/export/excel/to-downloads")
 def export_excel_to_downloads(req: ReportDataRequest):
     from app.services import export_jobs
 
-    if req.equipment_type not in ("T1 Isolation", "T2 Isolation", "Tracker", "String Combiner"):
-        raise HTTPException(400, detail="Direct-to-Downloads export is only for Tracker / String Combiner")
-
+    # Every equipment type is saved on disk under the single Reports root, in its own
+    # per-type subfolder (Reports\<type>\...). Tracker / String Combiner use their
+    # per-device folder writers; every other type uses the shared one-sheet-per-equipment
+    # writer — see the branch in run().
     ids = req.equipment_ids or [req.equipment_id]
     job_id = export_jobs.create_job()
     export_jobs.update(job_id, status="running", progress=0, message="Queued…")
@@ -621,14 +639,19 @@ def export_excel_to_downloads(req: ReportDataRequest):
             def prog(pct, msg):
                 export_jobs.update(job_id, status="running", progress=pct, message=msg)
 
-            # Each export writes its files into a single timestamped parent folder in
-            # Downloads (Tracker_Reports_<ts>\Tracker{n}.xlsx / SMB_Reports_<ts>\INV{n}.xlsx).
+            # Each export writes its files into this report type's subfolder under the
+            # single Reports root (Reports\<type>\...). Tracker / String Combiner have
+            # per-device writers; every other type saves one workbook via the shared
+            # one-sheet-per-equipment writer.
             if req.equipment_type == "String Combiner":
                 from app.services.smb_excel import export_smb_to_downloads
                 result = export_smb_to_downloads(req, ids, prog)
-            else:
+            elif req.equipment_type in ("T1 Isolation", "T2 Isolation", "Tracker"):
                 from app.services.t1_isolation_excel import export_to_downloads
                 result = export_to_downloads(req, ids, prog)
+            else:
+                from app.services.report_excel import export_generic_to_downloads
+                result = export_generic_to_downloads(req, ids, prog)
             # Absolute path on disk (the ZIP for Tracker, the folder for SMB).
             saved_path = result.get("path") or result.get("directory") or "Downloads"
             count = result.get("count", 0)

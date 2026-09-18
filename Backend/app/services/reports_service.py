@@ -13,7 +13,7 @@ from sqlalchemy import text
 from app.repositories.reports_repository import (
     ReportsRepository, EQUIPMENT_REGISTRY, _safe_name, _build_interval_expr,
 )
-from app.services import schema_cache, intervals
+from app.services import schema_cache, intervals, isolator_columns
 from app.schemas.reports_schema import ReportDataRequest
 from app.database.session import SessionLocal
 
@@ -44,20 +44,33 @@ _COUNT_WORKERS = 6
 
 
 def _map_tags_to_columns(equipment_type: str, tags: List[str]) -> List[str]:
-    """Resolve tag labels → real column names ONCE (shared across the batch)."""
+    """
+    Resolve tag labels → real column names ONCE (shared across the batch), then apply
+    this equipment type's canonical column ORDER.
+
+    For the isolator/Tracker types the order comes from
+    `isolator_columns.order_columns_by_id` — the SAME function the Excel export uses —
+    so the Report Data table and the generated workbook always present the columns in
+    the identical Id-first sequence, whatever order the client happened to send its
+    tag list in. Every other equipment type (Inverter, WMS, PPC, Alarms, MFM, String
+    Combiner, …) keeps the caller's order exactly as before.
+    """
     tag_meta = EQUIPMENT_REGISTRY.get(equipment_type, {}).get("tags", {})
     if not tag_meta:
-        return list(tags)
-    out = []
-    for tag in tags:
-        if tag in tag_meta:
-            out.append(tag)
-        else:
-            out.append(next(
-                (col for col, meta in tag_meta.items()
-                 if meta["label"] == tag or col == tag),
-                tag,
-            ))
+        out = list(tags)
+    else:
+        out = []
+        for tag in tags:
+            if tag in tag_meta:
+                out.append(tag)
+            else:
+                out.append(next(
+                    (col for col, meta in tag_meta.items()
+                     if meta["label"] == tag or col == tag),
+                    tag,
+                ))
+    if equipment_type in isolator_columns.ISOLATION_EQUIPMENT_TYPES:
+        out = isolator_columns.order_columns_by_id(out)
     return out
 
 
@@ -454,20 +467,9 @@ class ReportsService:
         if req.to_datetime <= req.from_datetime:
             raise HTTPException(400, detail="to_datetime must be after from_datetime")
 
-        config   = EQUIPMENT_REGISTRY.get(req.equipment_type, {})
-        tag_meta = config.get("tags", {})
-
-        column_names = []
-        for tag in req.tags:
-            if tag in tag_meta:
-                column_names.append(tag)
-            else:
-                found = next(
-                    (col for col, meta in tag_meta.items()
-                     if meta["label"] == tag or col == tag),
-                    tag
-                )
-                column_names.append(found)
+        # Same resolver + canonical ordering the batch path uses, so a single-equipment
+        # preview and a merged multi-equipment preview return columns in one order.
+        column_names = _map_tags_to_columns(req.equipment_type, req.tags)
 
         try:
             return ReportsRepository.get_report_data(
