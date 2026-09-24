@@ -1,7 +1,9 @@
 // src/pages/Reports/Reports.jsx
 import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react'
 import { useNavigate, useLocation } from 'react-router-dom'
-import { PageHeader, FormRow, FormGroup, Skeleton, Spinner } from '../../components/Common'
+import {
+  PageHeader, FormRow, FormGroup, Skeleton, Spinner, PromptDialog,
+} from '../../components/Common'
 import { useApp } from '../../utils/AppContext'
 import {
   INTERVAL_LABELS, AGG_OPTIONS, DEFAULT_AGG,
@@ -26,6 +28,7 @@ import {
   exportStreamUrl,
   startExcelToDownloads,
   createSavedReport,
+  fetchSavedReportCapacity,
 } from '../../services/api'
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
@@ -719,6 +722,14 @@ export default function Reports() {
   // saved selection; `autoLoadRef` remembers a Run/Load request; `restoreToken`
   // fires once the cascade finishes so an auto-load can run with the state settled.
   const [savingReport, setSavingReport] = useState(false)
+  // Saved-template allowance, read from the database (never hardcoded here) so the
+  // Save button can be disabled before the user fills in a name. The API enforces the
+  // same cap on create, so this is a courtesy, not the control.
+  const [savedCap, setSavedCap] = useState(null)   // { count, max, remaining, limit_reached, message }
+  const refreshSavedCap = useCallback(
+    () => fetchSavedReportCapacity().then(setSavedCap).catch(() => {}), [])
+  useEffect(() => { refreshSavedCap() }, [refreshSavedCap])
+  const savedFull = !!savedCap?.limit_reached
   const [restoreToken, setRestoreToken] = useState(0)
   const restoreRef   = useRef(null)
   const autoLoadRef  = useRef(false)
@@ -1004,20 +1015,42 @@ export default function Reports() {
   // Reports and survives a refresh/restart. Validates that a complete config AND
   // loaded data exist first (client req 9) — the Save button is also disabled until
   // then. Does NOT touch the report data, queries, calculations, or exports.
-  const handleSave = useCallback(async () => {
+  // Opening the Save Report dialog. `saveName` is the name it is seeded with (null =
+  // closed), captured once here so the generated timestamp does not tick over while
+  // the dialog is on screen. Every guard runs BEFORE the dialog opens, so the user is
+  // never asked for a name for a save that cannot succeed.
+  const [saveName,  setSaveName]  = useState(null)
+  const [saveError, setSaveError] = useState('')
+
+  const askSave = useCallback(async () => {
     if (!eqType)                  return showToast('Select Equipment Type')
     if (selectedEqIds.size === 0) return showToast('Select Equipment Identifier')
     if (selected.size === 0)      return showToast('Select at least one tag')
     if (!result)                  return showToast('Click Load Data and verify the report before saving')
 
-    const name = window.prompt('Save report as:', defaultReportName())
-    if (name === null) return                       // user cancelled
-    if (!name.trim())  return showToast('Report name is required')
+    // Re-read the live count first: another tab/user may have filled the last slot
+    // since this page loaded, and the dialog should not appear if saving will fail.
+    let cap = savedCap
+    try { cap = await fetchSavedReportCapacity(); setSavedCap(cap) } catch { /* fall back to the cached value */ }
+    if (cap?.limit_reached) return showToast(cap.message || 'Saved-template limit reached', 'error')
 
-    setSavingReport(true)
+    setSaveError('')
+    setSaveName(defaultReportName())
+  }, [eqType, selectedEqIds, selected, result, savedCap, defaultReportName, showToast])
+
+  const cancelSave = useCallback(() => {
+    if (savingReport) return          // never dismiss a save already running
+    setSaveName(null); setSaveError('')
+  }, [savingReport])
+
+  // The name is already trimmed and non-empty — PromptDialog validates and trims
+  // before it calls this. The save itself is unchanged.
+  const handleSave = useCallback(async (name) => {
+    if (savingReport) return                        // guards against a double submit
+    setSavingReport(true); setSaveError('')
     try {
       await createSavedReport({
-        name:           name.trim(),
+        name,
         equipment_type: eqType,
         equipment_ids:  [...selectedEqIds].filter(id => id && String(id).trim()),
         tags:           [...selected],
@@ -1027,14 +1060,23 @@ export default function Reports() {
         agg_function:   agg,
         page_size:      pageSize,
       })
+      setSaveName(null)
       showToast('Report saved successfully.')
     } catch (e) {
-      showToast(`Save failed: ${e.message}`)
+      // Nothing was written — keep the dialog open with the reason shown inline so the
+      // name is not lost and the user can retry. A 409 carries the limit wording, so
+      // surface it as-is rather than wrapping it in a generic failure message.
+      const msg = /Maximum limit of/i.test(e.message) ? e.message : `Save failed: ${e.message}`
+      setSaveError(msg)
+      showToast(msg, 'error')
     } finally {
       setSavingReport(false)
+      // Refresh the allowance either way: a success consumed a slot, and a failure may
+      // mean someone else just did. The Save button reflects it with no page refresh.
+      refreshSavedCap()
     }
-  }, [eqType, selectedEqIds, selected, result, fromDate, toDate, interval, agg,
-      pageSize, defaultReportName, showToast])
+  }, [savingReport, eqType, selectedEqIds, selected, fromDate, toDate, interval, agg,
+      pageSize, showToast, refreshSavedCap])
 
   // When a Preconfigured report was opened with Run/Load, auto-trigger Load Data
   // once the equipment→tags restore cascade has finished (restoreToken bumps) and
@@ -1640,15 +1682,23 @@ export default function Reports() {
           {/* Save the current configuration as a Preconfigured report. Enabled only
               after Load Data succeeds (a config + verified data must exist), so it
               validates before saving. Independent of Export Excel, which is untouched. */}
-          <button className="btn btn-outline btn-sm" onClick={handleSave}
-            disabled={savingReport || !canExport || !result}
-            title={result
-              ? 'Save this report configuration to Preconfigured Reports'
-              : 'Load Data first, then Save'}>
+          <button className="btn btn-outline btn-sm" onClick={askSave}
+            disabled={savingReport || !canExport || !result || savedFull}
+            title={savedFull
+              ? (savedCap?.message || 'Saved-template limit reached')
+              : result
+                ? 'Save this report configuration to Preconfigured Reports'
+                : 'Load Data first, then Save'}>
             {savingReport
               ? <><Spinner size={12} /> Saving...</>
               : <>💾 Save</>}
           </button>
+
+          {savedFull && (
+            <span className="text-[11px] text-red-400 max-w-[380px] leading-tight">
+              {savedCap.message}
+            </span>
+          )}
 
           <ExportBtn onClick={handleExportExcel} icon="📗" label="Excel" />
 
@@ -1878,6 +1928,24 @@ export default function Reports() {
           </>
         )}
       </div>
+
+      {/* Save Report — the app's own dialog, not window.prompt(). Shared component,
+          so it matches the Rename/Delete dialogs on Preconfigured Reports. It is the
+          one save path on this page, so it covers every equipment/report type. */}
+      <PromptDialog
+        open={saveName !== null}
+        title="Save Report"
+        label="Report Name"
+        submitLabel="Save Report"
+        placeholder="Enter a report name"
+        initialValue={saveName || ''}
+        validate={name => (name ? null : 'Report name is required')}
+        error={saveError}
+        busy={savingReport}
+        onCancel={cancelSave}
+        onSubmit={handleSave}
+        description={<p>Enter a name for this report.</p>}
+      />
     </div>
   )
 }

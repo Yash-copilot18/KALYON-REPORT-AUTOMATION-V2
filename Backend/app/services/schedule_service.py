@@ -73,6 +73,16 @@ SUPPORTED_REPORT_TYPES = GENERATION_REPORT_TYPES
 DEFAULT_SCHEDULE_TIME = "20:30"
 
 
+# Plant-level reports cover the whole plant and therefore carry NO equipment
+# identifier. Kept beside the type list so the rule lives in one place.
+PLANT_LEVEL_REPORT_TYPES = ("Yearly Generation",)
+
+
+def is_plant_level(equipment_type: Optional[str]) -> bool:
+    """True when this report type has no equipment identifier by design."""
+    return (equipment_type or "").strip() in PLANT_LEVEL_REPORT_TYPES
+
+
 def is_supported_type(equipment_type: Optional[str]) -> bool:
     """
     Scheduling now supports EVERY equipment/report type the application exposes: the
@@ -311,6 +321,13 @@ def _resolve_recipients(s: ReportSchedule) -> List[str]:
         return saved
     fallback = email_service.get_recipient_email()
     return [fallback] if fallback else []
+
+
+# Public alias — the router asks "who would this schedule e-mail?" before starting a
+# manual send, and should not reach into a private helper to find out.
+def recipients_for(s: ReportSchedule) -> List[str]:
+    """Every address this schedule would send to, exactly as execution resolves them."""
+    return _resolve_recipients(s)
 
 
 def normalize_recipients(value) -> str:
@@ -763,6 +780,66 @@ def _build_report_file(db: Session, s: ReportSchedule):
     return _build_equipment_file(db, s)
 
 
+def _generate_and_email(db: Session, s: ReportSchedule, t0: datetime,
+                        recipients: List[str], *, kind: str, label: str) -> Dict:
+    """
+    THE generation + e-mail step, shared by every path that sends a report.
+
+    It builds the file through _build_report_file and hands it to email_service —
+    the same queries, the same Excel/PDF builders, the same SMTP configuration, the
+    same recipient list and the same attachment handling — so a scheduled send, a
+    manual send of a saved schedule and an ad-hoc send can never drift apart.
+
+    It writes NOTHING to the database. Recording the attempt (a ScheduleRun) and
+    advancing the clock belong to the caller, because an ad-hoc send has no schedule
+    row to record against.
+
+    Returns {"ok": bool, "filename": str|None, "size": int|None, "error": str|None}.
+    """
+    fmt = _normalize_format(s.report_format)
+    logger.info("[%s] Generating %s -> %s/%s | fmt=%s | to=%d recipient(s) %s",
+                kind, label, s.equipment_type, s.equipment_id, fmt,
+                len(recipients), recipients)
+
+    # Fail fast if SMTP isn't configured. Only the missing NAMES are reported.
+    missing = email_service.get_missing_config()
+    if missing:
+        err = ("SMTP is not configured. Missing: " + ", ".join(missing)
+               + ". Set them in Backend/.env (see .env.example).")
+        logger.error("[%s] %s aborted -> %s", kind, label, err)
+        return {"ok": False, "filename": None, "size": None, "error": err}
+
+    try:
+        data, filename, mime_main, mime_sub = _build_report_file(db, s)
+    except Exception as e:  # noqa: BLE001
+        err = f"Report generation failed: {type(e).__name__}: {e}"
+        logger.error("[%s] %s -> %s", kind, label, err, exc_info=True)
+        return {"ok": False, "filename": None, "size": None, "error": err}
+
+    subject = f"Kalyon Scheduled Report - {s.equipment_type}/{s.equipment_id} - {t0.strftime(_FMT)}"
+    body = (
+        "Kalyon Solar Monitoring — Automated Report\n\n"
+        f"Equipment : {s.equipment_type} / {s.equipment_id}\n"
+        f"Format    : {fmt}\n"
+        f"Frequency : {s.frequency}\n"
+        f"Generated : {t0.strftime(_FMT)}\n\n"
+        "The requested report is attached.\n"
+    )
+    result = email_service.send_email_with_attachment(
+        to_email=recipients, subject=subject, body=body,
+        attachment_bytes=data, attachment_filename=filename,
+        mime_main=mime_main, mime_sub=mime_sub,
+    )
+    if result.get("success"):
+        logger.info("[%s] %s -> SUCCESS | %s | delivered to %d recipient(s)",
+                    kind, label, filename, len(recipients))
+        return {"ok": True, "filename": filename, "size": len(data), "error": None}
+
+    err = result.get("error")
+    logger.error("[%s] %s -> email FAILED | %s", kind, label, err)
+    return {"ok": False, "filename": filename, "size": len(data), "error": err}
+
+
 def execute_schedule(db: Session, s: ReportSchedule, *, kind: str = "RUN") -> Dict:
     """
     Generate the real report, e-mail it, record a ScheduleRun, and advance
@@ -798,44 +875,49 @@ def execute_schedule(db: Session, s: ReportSchedule, *, kind: str = "RUN") -> Di
             "error":          run.error,
         }
 
-    # Fail fast if SMTP isn't configured.
-    missing = email_service.get_missing_config()
-    if missing:
-        run.error = ("SMTP is not configured. Missing: " + ", ".join(missing)
-                     + ". Set them in Backend/.env (see .env.example).")
-        logger.error("[%s] schedule id=%s aborted -> %s", kind, s.id, run.error)
-        return _finalize("Failed")
+    outcome = _generate_and_email(db, s, t0, recipients,
+                                  kind=kind, label=f"schedule id={s.id}")
+    run.report    = outcome["filename"]
+    run.file_size = outcome["size"]
+    run.error     = outcome["error"]
+    return _finalize("Success" if outcome["ok"] else "Failed")
 
-    try:
-        data, filename, mime_main, mime_sub = _build_report_file(db, s)
-        run.report = filename
-        run.file_size = len(data)
-    except Exception as e:  # noqa: BLE001
-        run.error = f"Report generation failed: {type(e).__name__}: {e}"
-        logger.error("[%s] schedule id=%s -> %s", kind, s.id, run.error, exc_info=True)
-        return _finalize("Failed")
 
-    subject = f"Kalyon Scheduled Report - {s.equipment_type}/{s.equipment_id} - {t0.strftime(_FMT)}"
-    body = (
-        "Kalyon Solar Monitoring — Automated Report\n\n"
-        f"Equipment : {s.equipment_type} / {s.equipment_id}\n"
-        f"Format    : {fmt}\n"
-        f"Frequency : {s.frequency}\n"
-        f"Generated : {t0.strftime(_FMT)}\n\n"
-        "The requested report is attached.\n"
+def generate_and_send_adhoc(db: Session, data: Dict) -> Dict:
+    """
+    ONE-OFF "Generate & Send": build the report described by the form and e-mail it
+    immediately. NOTHING is persisted - no ReportSchedule, no ScheduleRun, no clock
+    change - so this never appears in the Report Schedules list.
+
+    The configuration is carried on a TRANSIENT ReportSchedule that is deliberately
+    never added to the session. That is what lets the send go through the very same
+    _generate_and_email the scheduler uses, instead of a second, manual-only report
+    implementation that could drift out of step.
+    """
+    t0 = datetime.now()
+    s = ReportSchedule(
+        equipment_type=data.get("eq_type") or data.get("equipment_type") or "",
+        equipment_id=data.get("eq_id") or data.get("equipment_id") or "",
+        from_date=_parse_date(data.get("from")),
+        to_date=_parse_date(data.get("to")),
+        interval=data.get("interval") or "hourly",
+        agg_function=data.get("agg") or data.get("agg_function") or "avg",
+        report_format=_normalize_format(data.get("format")),
+        frequency=data.get("freq") or data.get("frequency") or "Daily",
+        status="Adhoc",
+        recipients=normalize_recipients(data.get("recipients")) or None,
     )
-    result = email_service.send_email_with_attachment(
-        to_email=recipients, subject=subject, body=body,
-        attachment_bytes=data, attachment_filename=filename,
-        mime_main=mime_main, mime_sub=mime_sub,
-    )
-    if result.get("success"):
-        logger.info("[%s] schedule id=%s -> SUCCESS | %s | delivered to %d recipient(s)",
-                    kind, s.id, filename, len(recipients))
-        return _finalize("Success")
-    run.error = result.get("error")
-    logger.error("[%s] schedule id=%s -> email FAILED | %s", kind, s.id, run.error)
-    return _finalize("Failed")
+    recipients = _resolve_recipients(s)
+
+    outcome = _generate_and_email(db, s, t0, recipients,
+                                  kind="ADHOC", label="ad-hoc send")
+    return {
+        "status":         "Success" if outcome["ok"] else "Failed",
+        "execution_time": t0.strftime(_FMT),
+        "recipient":      ", ".join(recipients),
+        "report":         outcome["filename"],
+        "error":          outcome["error"],
+    }
 
 
 def run_schedule_now(db: Session, schedule_id: int) -> Optional[Dict]:

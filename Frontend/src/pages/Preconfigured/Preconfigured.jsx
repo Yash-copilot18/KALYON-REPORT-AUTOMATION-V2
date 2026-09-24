@@ -15,7 +15,9 @@
 // Excel is the only export format offered on this page by design.
 
 import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react'
-import { PageHeader, FormGroup, Spinner, Skeleton } from '../../components/Common'
+import {
+  PageHeader, FormGroup, Spinner, Skeleton, ConfirmDialog, PromptDialog,
+} from '../../components/Common'
 import { useApp } from '../../utils/AppContext'
 import {
   INTERVAL_LABELS, AGG_OPTIONS, DEFAULT_AGG, withAggregation,
@@ -31,9 +33,12 @@ import {
   fetchMultiReportData,
   exportMultiReportExcel,
   listSavedReports,
+  fetchSavedReportCapacity,
+  getSavedReport,
   updateSavedReport,
   deleteSavedReport,
   fetchMergedPage,
+  exportReportExcelV2,
 } from '../../services/api'
 
 // The only report types this page supports.
@@ -152,9 +157,15 @@ export default function Preconfigured() {
   const [savedReports, setSavedReports] = useState([])                  // backend reports (Reports page)
   const [loadingSaved, setLoadingSaved] = useState(true)
   const [tplId,      setTplId]      = useState('')   // unified dropdown key (see itemKey)
+  // Saved-template allowance straight from the database: { count, max, remaining,
+  // limit_reached, message }. The maximum is a single backend constant — nothing here
+  // hardcodes 20 — and it is re-read on every list refresh so the badge stays true
+  // after a create/delete anywhere, including another browser.
+  const [cap, setCap] = useState(null)
   const refreshTemplates = useCallback(() => setTemplates(listTemplates()), [])
   const refreshSavedReports = useCallback(() => {
     setLoadingSaved(true)
+    fetchSavedReportCapacity().then(setCap).catch(() => {})
     return listSavedReports()
       .then(data => setSavedReports(Array.isArray(data) ? data : []))
       .catch(() => setSavedReports([]))
@@ -335,7 +346,29 @@ export default function Preconfigured() {
       { selected, fromDate, toDate, interval, agg }, pageNum, size),
   [selected, fromDate, toDate, interval, agg])
 
-  const ready = selected.length > 0
+  // An opened BACKEND template is its own report: its columns live in the saved record
+  // (or in `beSelected` while editing), NOT in the multi-equipment builder above — which
+  // is deliberately cleared when such a template is opened. Generate/Export therefore
+  // have to read their configuration from the template, otherwise they are permanently
+  // disabled (builder empty) and, if enabled, would run an unrelated configuration.
+  const backendMode  = viewSource === 'backend' && !!backendRec
+  const backendCols  = backendMode ? (editing ? beSelected : (backendRec.tags || [])) : []
+  const activeCols   = backendMode ? backendCols : selected
+  const ready        = activeCols.length > 0
+
+  // Generating/exporting always uses the configuration as SAVED. Re-read it by id so the
+  // request can never be built from frontend state that drifted from the database.
+  const freshTemplate = useCallback(async (rec) => {
+    try {
+      const latest = await getSavedReport(rec.id)
+      if (latest && latest.id) {
+        setBackendRec(latest)
+        if (!editing) setBeSelected(latest.tags || [])
+        return latest
+      }
+    } catch { /* fall back to the record in hand rather than blocking the action */ }
+    return rec
+  }, [editing])
 
   const runReport = useCallback(async (pageNum, size) => {
     setGenerating(true); setError(null)
@@ -353,6 +386,32 @@ export default function Preconfigured() {
 
   const handleExportExcel = async () => {
     if (!ready) return showToast('Select at least one column')
+    if (backendMode) {
+      // Export the OPENED template through the same endpoint the Reports page uses for
+      // this configuration, so the workbook's structure/formatting is unchanged and its
+      // columns match the Report Data table exactly.
+      if (editing && dirty) return showToast('Save Changes first — then export the saved template')
+      setExporting(true)
+      try {
+        const rec = await freshTemplate(backendRec)
+        // `use_selected_tags` makes the workbook carry EXACTLY the template's saved
+        // columns, in their saved order. Without it the export falls back to each
+        // equipment's complete tag set (64 columns for an inverter), which is right for
+        // the Reports page but wrong here, where the chosen columns ARE the report.
+        const blob = await exportReportExcelV2({
+          ...backendReportPayload(rec, 1, pageSize), use_selected_tags: true,
+        })
+        if (!(blob instanceof Blob) || blob.size === 0) throw new Error('Empty file received from server')
+        const safe = String(rec.name || 'Report').replace(/[\/:*?"<>|]+/g, '_').trim() || 'Report'
+        saveBlob(blob, `${safe}_${todayDMY()}.xlsx`)
+        showToast(`Excel exported · ${(rec.tags || []).length} columns`)
+      } catch (e) {
+        showToast(`Export failed: ${e.message}`)
+      } finally {
+        setExporting(false)
+      }
+      return
+    }
     setExporting(true)
     try {
       // page_size is ignored by the export — the workbook holds the whole range.
@@ -430,6 +489,16 @@ export default function Preconfigured() {
 
   const handleGenerate = useCallback(async () => {
     if (!ready) return showToast('Select at least one column')
+    if (backendMode) {
+      // Re-run the OPENED template from its latest saved configuration. This is not a new
+      // configuration, so the opened/edit state is kept and NO auto-template is recorded —
+      // generating must never spawn a duplicate of the template being worked on.
+      if (editing && dirty) return showToast('Save Changes first — then generate the saved template')
+      const rec = await freshTemplate(backendRec)
+      await loadBackendPage(rec, 1, pageSize)
+      showToast(`Generated "${rec.name}" · ${(rec.tags || []).length} columns`)
+      return
+    }
     setViewSource('local'); setBackendRec(null)   // the table now shows a builder report
     const ok = await runReport(1, pageSize)
     if (!ok) return
@@ -443,7 +512,8 @@ export default function Preconfigured() {
     }
     // A failure here (storage full/disabled) must never block the generated report,
     // which is already on screen — so it is intentionally silent.
-  }, [ready, pageSize, runReport, autoTemplateName, snapshotConfig, refreshTemplates, showToast])
+  }, [ready, backendMode, editing, dirty, backendRec, freshTemplate, loadBackendPage,
+      pageSize, runReport, autoTemplateName, snapshotConfig, refreshTemplates, showToast])
 
   // ── Template actions (Open · Edit · Save Changes · Rename · Delete) ────────
 
@@ -542,7 +612,7 @@ export default function Preconfigured() {
       if (!r) return showToast('Open the report first')
       if (!beSelected.length) return showToast('Select at least one column')
       try {
-        await updateSavedReport(r.id, {
+        const saved = await updateSavedReport(r.id, {
           name:           r.name,                 // rename is a separate action
           equipment_type: r.equipment_type,
           equipment_ids:  r.equipment_ids || [],
@@ -554,8 +624,13 @@ export default function Preconfigured() {
           page_size:      r.page_size,
         })
         await refreshSavedReports()
-        const updated = { ...r, tags: beSelected, tag_count: beSelected.length }
+        // Adopt what the backend actually stored (falling back to a fresh read), so the
+        // page can never hold a version of the template the database does not have.
+        let updated = saved && saved.id ? saved : null
+        if (!updated) { try { updated = await getSavedReport(r.id) } catch { /* handled below */ } }
+        if (!updated) updated = { ...r, tags: beSelected, tag_count: beSelected.length }
         setBackendRec(updated)
+        setBeSelected(updated.tags || [])
         setEditing(false); setDirty(false)
         await loadBackendPage(updated, 1, pageSize)   // reload the table with new columns
         showToast(`Saved changes to "${r.name}"`)
@@ -573,13 +648,50 @@ export default function Preconfigured() {
   }, [openedTpl, backendRec, beSelected, snapshotConfig, refreshSavedReports,
       refreshTemplates, loadBackendPage, pageSize, showToast])
 
-  // Rename: prompt for a new name — routed to the correct store by source.
-  const handleTplRename = useCallback(async () => {
+  // ── Rename — in-app dialog ────────────────────────────────────────────────
+  // Like the delete confirmation, `renaming` holds the ITEM being renamed (null =
+  // closed), so the dialog keeps naming the template the user clicked even if the
+  // dropdown moves underneath it. `renameBusy` locks the dialog while the request is
+  // in flight — that is what stops a second rename being sent.
+  const [renaming,    setRenaming]    = useState(null)
+  const [renameBusy,  setRenameBusy]  = useState(false)
+  const [renameError, setRenameError] = useState('')
+
+  const askTplRename = useCallback(() => {
     if (!selectedItem) return showToast('Select a template to rename')
-    const next = window.prompt('Rename template', selectedItem.name || '')
-    if (next === null) return          // user cancelled
-    const clean = String(next).trim()
-    if (!clean) return showToast('Template name is required')
+    setRenameError('')
+    setRenaming(selectedItem)
+  }, [selectedItem, showToast])
+
+  const cancelTplRename = useCallback(() => {
+    if (renameBusy) return             // never dismiss a rename already running
+    setRenaming(null); setRenameError('')
+  }, [renameBusy])
+
+  /**
+   * Validation for the rename dialog, run on the TRIMMED value.
+   * Returns an error string to keep Rename Template disabled, or null to allow it.
+   *
+   * The duplicate check runs against the loaded template list (both stores), which is
+   * the rule the localStorage store already enforces; the database has no unique
+   * constraint on the name and none was added, so for a saved report this is a UI
+   * guard that keeps the dropdown unambiguous.
+   */
+  const validateRename = useCallback((name) => {
+    if (!name) return 'Template name is required'
+    if (!renaming) return null
+    if (name === (renaming.name || '').trim()) return 'Enter a name different from the current one'
+    if (name.length > 200) return 'Template name must be 200 characters or fewer'
+    const clash = dropdownItems.some(
+      it => it.key !== renaming.key && (it.name || '').trim().toLowerCase() === name.toLowerCase())
+    if (clash) return `A template named "${name}" already exists`
+    return null
+  }, [renaming, dropdownItems])
+
+  const handleTplRename = useCallback(async (clean) => {
+    const selectedItem = renaming
+    if (!selectedItem || renameBusy) return
+    setRenameBusy(true); setRenameError('')
 
     if (selectedItem.source === 'backend') {
       // PUT requires the full config (backend validates it) — resend the record with
@@ -598,31 +710,63 @@ export default function Preconfigured() {
           page_size:      r.page_size,
         })
         await refreshSavedReports()
+        // The record keeps its id, so `tplId` still points at it — the renamed
+        // template stays selected, and stays opened if it was open, with the new
+        // name showing in the dropdown, the status line and the table header.
         if (openedTpl?.key === selectedItem.key) {
           setOpenedTpl(t => (t ? { ...t, name: clean } : t))
           setBackendRec(rec => (rec ? { ...rec, name: clean } : rec))
         }
+        setRenaming(null)
         showToast(`Renamed to "${clean}"`)
       } catch (e) {
-        showToast(`Rename failed: ${e.message}`)
+        // Nothing changed server-side — leave the list and the selection alone and
+        // keep the dialog open with the reason shown inline so the user can retry.
+        setRenameError(e.message || 'Rename failed')
+        showToast(`Rename failed: ${e.message}`, 'error')
+      } finally {
+        setRenameBusy(false)
       }
       return
     }
 
     const res = renameTemplate(selectedItem.record.id, clean)
-    if (!res.ok) return showToast(res.error)
+    if (!res.ok) {
+      setRenameBusy(false); setRenameError(res.error)
+      return showToast(res.error, 'error')
+    }
     refreshTemplates()
     if (openedTpl?.key === selectedItem.key) setOpenedTpl(t => (t ? { ...t, name: clean } : t))
+    setRenaming(null); setRenameBusy(false)
     showToast(`Renamed to "${res.template.name}"`)
-  }, [selectedItem, openedTpl, refreshSavedReports, refreshTemplates, showToast])
+  }, [renaming, renameBusy, openedTpl, refreshSavedReports, refreshTemplates, showToast])
+
+  // ── Delete — in-app confirmation ──────────────────────────────────────────
+  // `confirmDelete` holds the item the dialog is asking about (null = closed) rather
+  // than a bare boolean, so the dialog always names the template the user clicked even
+  // if the dropdown selection changes underneath it. `deleting` locks the dialog while
+  // the request is in flight, which is what prevents a double delete.
+  const [confirmDelete, setConfirmDelete] = useState(null)
+  const [deleting,      setDeleting]      = useState(false)
+
+  const askTplDelete = useCallback(() => {
+    if (!selectedItem) return showToast('Select a template to delete')
+    setConfirmDelete(selectedItem)
+  }, [selectedItem, showToast])
+
+  const cancelTplDelete = useCallback(() => {
+    if (deleting) return          // never dismiss a delete that is already running
+    setConfirmDelete(null)
+  }, [deleting])
 
   const handleTplDelete = useCallback(async () => {
-    if (!selectedItem) return showToast('Select a template to delete')
-    if (!window.confirm(`Delete "${selectedItem.name}"? This cannot be undone.`)) return
+    const target = confirmDelete
+    if (!target || deleting) return
+    setDeleting(true)
 
     // Deleting only removes the saved CONFIGURATION (DB row / localStorage entry); it
     // never touches generated Excel files under Downloads\Reports.
-    const wasOpened = openedTpl?.key === selectedItem.key
+    const wasOpened = openedTpl?.key === target.key
     const clearOpened = () => {
       if (wasOpened) {
         setOpenedTpl(null); setEditing(false); setDirty(false)
@@ -631,27 +775,36 @@ export default function Preconfigured() {
       }
     }
 
-    if (selectedItem.source === 'backend') {
+    if (target.source === 'backend') {
       try {
-        await deleteSavedReport(selectedItem.record.id)
+        await deleteSavedReport(target.record.id)
+        // refreshSavedReports re-reads BOTH the list and the saved-template count, so
+        // the "Saved Templates: N / 20" heading updates in the same pass.
         await refreshSavedReports()
         clearOpened()
         setTplId('')
+        setConfirmDelete(null)
         showToast('Saved report deleted')
       } catch (e) {
-        showToast(`Delete failed: ${e.message}`)
+        // The row is still there — leave the list, the selection and the count alone.
+        // The dialog stays open so the user can retry or cancel; the failure is
+        // reported through the app's toast, never a browser alert().
+        showToast(`Delete failed: ${e.message}`, 'error')
+      } finally {
+        setDeleting(false)
       }
       return
     }
 
-    const localId = selectedItem.record.id
-    const res = deleteTemplate(localId)
-    if (!res.ok) return showToast(res.error)
+    const res = deleteTemplate(target.record.id)
+    if (!res.ok) { setDeleting(false); return showToast(res.error, 'error') }
     refreshTemplates()
     clearOpened()
     setTplId('')
+    setConfirmDelete(null)
+    setDeleting(false)
     showToast('Template deleted')
-  }, [selectedItem, openedTpl, refreshSavedReports, refreshTemplates, showToast])
+  }, [confirmDelete, deleting, openedTpl, refreshSavedReports, refreshTemplates, showToast])
 
   // ── Preview table ─────────────────────────────────────────────────────────
   // Shared by BOTH view sources so the report table is never duplicated:
@@ -693,9 +846,19 @@ export default function Preconfigured() {
           creates one by hand. Pure front-end (localStorage); does not affect report
           generation or Excel export. */}
       <div className="card mb-3">
-        <div className="card-title">Saved Templates</div>
+        {/* ONE heading for this section, carrying the live count: "Saved Templates: 6 / 20".
+            The count comes from the database (see `cap`); the maximum is the backend
+            constant, never hardcoded here. At the cap the heading turns red and the full
+            message is shown below it. */}
+        <div className={`card-title ${cap?.limit_reached ? 'text-red-400' : ''}`}>
+          Saved Templates{cap ? `: ${cap.count} / ${cap.max}` : ''}
+        </div>
+        {cap?.limit_reached && (
+          <div className="text-[11px] text-red-400 mb-2 leading-tight">{cap.message}</div>
+        )}
         <div className="flex flex-wrap items-end gap-x-4 gap-y-3">
-          <FormGroup label="Saved Templates">
+          {/* No label here — the section heading above already names it. */}
+          <FormGroup>
             <select className="form-control" style={{ minWidth: 260 }}
               value={tplId}
               onChange={e => setTplId(e.target.value)}>
@@ -723,12 +886,12 @@ export default function Preconfigured() {
               ✔ Save Changes
             </button>
             <button type="button" className="btn btn-outline btn-sm"
-              onClick={handleTplRename} disabled={!tplId}
+              onClick={askTplRename} disabled={!tplId || renameBusy}
               title="Rename the selected template">
               🏷 Rename
             </button>
             <button type="button" className="btn btn-outline btn-sm"
-              onClick={handleTplDelete} disabled={!tplId}
+              onClick={askTplDelete} disabled={!tplId || deleting}
               title="Delete the selected template">
               🗑 Delete
             </button>
@@ -993,7 +1156,7 @@ export default function Preconfigured() {
             disabled={generating || !ready}>
             {generating
               ? <><Spinner size={12} /> Generating...</>
-              : <>📥 Generate Report · {selected.length} columns</>}
+              : <>📥 Generate Report · {activeCols.length} columns</>}
           </button>
           <button className="btn btn-success btn-sm" onClick={handleExportExcel}
             disabled={exporting || !ready}>
@@ -1121,6 +1284,49 @@ export default function Preconfigured() {
           </>
         )}
       </div>
+
+      {/* Rename — the app's own dialog, not window.prompt(). */}
+      <PromptDialog
+        open={!!renaming}
+        title="Rename Saved Template"
+        label="New Template Name"
+        submitLabel="Rename Template"
+        busyLabel="Renaming…"
+        placeholder="Enter a template name"
+        initialValue={renaming?.name || ''}
+        validate={validateRename}
+        error={renameError}
+        busy={renameBusy}
+        onCancel={cancelTplRename}
+        onSubmit={handleTplRename}
+        description={
+          <p>
+            Current template:{' '}
+            <span className="text-ge-text1 font-medium break-words">
+              &ldquo;{renaming?.name}&rdquo;
+            </span>
+          </p>
+        }
+      />
+
+      {/* Destructive confirmation — the app's own dialog, not window.confirm(). */}
+      <ConfirmDialog
+        open={!!confirmDelete}
+        title="Delete Saved Template"
+        confirmLabel="Delete Template"
+        busyLabel="Deleting…"
+        busy={deleting}
+        onCancel={cancelTplDelete}
+        onConfirm={handleTplDelete}
+      >
+        <p>
+          Are you sure you want to delete{' '}
+          <span className="text-ge-text1 font-medium break-words">
+            &ldquo;{confirmDelete?.name}&rdquo;
+          </span>?
+        </p>
+        <p className="mt-2 text-ge-text3">This action cannot be undone.</p>
+      </ConfirmDialog>
     </div>
   )
 }

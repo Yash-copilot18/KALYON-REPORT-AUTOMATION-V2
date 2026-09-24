@@ -10,6 +10,7 @@
 
 import { jsPDF } from 'jspdf'
 import autoTableImport from 'jspdf-autotable'
+import { drawVectorChart, drawNoticeBox } from './pdfCharts'
 
 // jspdf-autotable's default export is the function under a bundler (Vite) but an
 // interop object under Node ESM — resolve to the callable either way.
@@ -170,6 +171,28 @@ function drawChart(doc, chart, y) {
     doc.text('(chart unavailable)', MARGIN, y + 12)
     return y + 22
   }
+}
+
+// ── Vector chart (drawn from data, see pdfCharts.js), page-broken if needed ─────
+// Full content width at a fixed, readable height: one chart fits under the page-1 header
+// and KPI card, two fit on each continuation page. A chart is never split across pages.
+const VECTOR_CHART_H = 232
+function drawVectorChartBlock(doc, spec, y) {
+  const W = doc.internal.pageSize.getWidth()
+  if (y + VECTOR_CHART_H > bottomLimit(doc)) {
+    doc.addPage()
+    y = contentTopCont()
+  }
+  drawVectorChart(doc, spec, MARGIN, y, W - MARGIN * 2, VECTOR_CHART_H)
+  return y + VECTOR_CHART_H + 14
+}
+
+// ── Notice box (e.g. no data for the selected range), in place of charts ─────
+function drawNoticeBlock(doc, notice, y) {
+  const W = doc.internal.pageSize.getWidth()
+  const h = 70
+  if (y + h > bottomLimit(doc)) { doc.addPage(); y = contentTopCont() }
+  return drawNoticeBox(doc, notice.text, notice.detail, MARGIN, y, W - MARGIN * 2, h) + 14
 }
 
 // ── One table via autotable (column header on the first page only) ───────────
@@ -382,7 +405,9 @@ function drawInverterGrid(doc, blocks, startY) {
  * @param {string} cfg.reportTitle   e.g. "Daily Generation Report"
  * @param {string} cfg.subtitle      the applied period, e.g. "08/02/2024"
  * @param {Array}  cfg.meta          [{label, value}] key facts card
- * @param {Array}  cfg.charts        [{title, dataUrl, width, height}]
+ * @param {Array}  cfg.charts        [{title, dataUrl, width, height}] (image) or
+ *                                    [{vector: spec}] (native chart — see pdfCharts.js)
+ * @param {Object} [cfg.notice]      {text, detail} — boxed message drawn before the charts
  * @param {Array}  [cfg.inverterBlocks] [{name, value}] — DGR only: the inverter-wise
  *                                    generation blocks (INV1 … INVn), drawn as a responsive
  *                                    blue grid above the tables; paginates cleanly if needed.
@@ -396,14 +421,18 @@ export function renderReportDoc(cfg) {
   const {
     plant, reportTitle, subtitle,
     meta = [], charts = [], inverterBlocks = [], tables = [], wmsCards = [],
-    orientation = 'landscape', compress = true, footer = true,
+    notice = null, orientation = 'landscape', compress = true, footer = true,
   } = cfg
 
   const doc = new jsPDF({ orientation, unit: 'pt', format: 'a4', compress })
   const generatedAt = stamp()
 
   let y = drawMeta(doc, meta, contentTop())
-  for (const chart of charts) if (chart?.dataUrl) y = drawChart(doc, chart, y)
+  if (notice?.text) y = drawNoticeBlock(doc, notice, y)
+  for (const chart of charts) {
+    if (chart?.vector) y = drawVectorChartBlock(doc, chart.vector, y)   // native, from data
+    else if (chart?.dataUrl) y = drawChart(doc, chart, y)                // image (DGR/MGR/YGR)
+  }
   // DGR inverter-wise generation blocks — above the tables (req 5 ordering).
   if (inverterBlocks.length) y = drawInverterGrid(doc, inverterBlocks, y)
   for (const table of tables) y = drawTable(doc, table, y)

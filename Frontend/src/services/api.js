@@ -470,6 +470,12 @@ export const deleteSchedule = (id) =>
 export const runSchedule = (id) =>
   api.post(`/api/v1/scheduled/schedules/${id}/run`)
 
+// One-off "Generate & Send": build the report the Create-Schedule form describes and
+// e-mail it now. Saves NOTHING — no schedule, no run record — but generates and sends
+// through the same backend service the scheduler uses.
+export const generateAndSendReport = (payload) =>
+  api.post('/api/v1/scheduled/generate-send', payload)
+
 export const pauseSchedule = (id) =>
   api.post(`/api/v1/scheduled/schedules/${id}/pause`)
 
@@ -488,6 +494,12 @@ export const listSavedReports = () =>
 
 export const createSavedReport = (payload) =>
   api.post('/api/v1/saved-reports', payload)
+
+// Saved-template allowance straight from the database — { count, max, remaining,
+// limit_reached, message }. The maximum lives in ONE backend constant, so the UI
+// never hardcodes it; the API enforces the same cap on create regardless.
+export const fetchSavedReportCapacity = () =>
+  api.get('/api/v1/saved-reports/count')
 
 export const getSavedReport = (id) =>
   api.get(`/api/v1/saved-reports/${id}`)

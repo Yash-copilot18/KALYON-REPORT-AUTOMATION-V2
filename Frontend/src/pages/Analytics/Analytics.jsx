@@ -13,8 +13,8 @@ import { KpiCard, PageHeader, DataTable, Skeleton, Spinner } from '../../compone
 import { RECHARTS_COLORS as C } from '../../utils/helpers'
 import { fetchAnalyticsOverview, fetchWmsColumns, fetchWmsSeriesRange, fetchReportDataV2 } from '../../services/api'
 import { useApp } from '../../utils/AppContext'
-import { captureChartPng } from '../../utils/chartCapture'
 import { buildReportPdf } from '../../utils/pdfReport'
+import { specHasData } from '../../utils/pdfCharts'
 import { columnValueLabel, rowValueLabel, domainMax, CHART_LABEL_COLOR } from '../../utils/chartValueLabel'
 
 const PLANT_NAME = 'Kalyon Solar Power Plant'
@@ -418,10 +418,22 @@ export default function Analytics() {
           return o
         })
       }
-      setWms({ series, stations, params, loading: false, error: null })
+      // What the database ACTUALLY returned for this range: the rows are ordered by
+      // time, so the first/last timestamps are the real span of WMS records inside the
+      // selection. Nothing is assumed about when WMS data starts or ends — an empty
+      // result means "no records in this range", and a narrower span than the one
+      // requested means the selection only partly overlaps the WMS history.
+      const coverage = rows.length
+        ? { rows: rows.length,
+            first: String(rows[0].timestamp).slice(0, 10),
+            last:  String(rows[rows.length - 1].timestamp).slice(0, 10) }
+        : { rows: 0, first: null, last: null }
+      setWms({ series, stations, params, loading: false, error: null,
+               range: { from: f, to: t }, coverage })
     } catch (e) {
       if (id !== wmsReq.current) return
-      setWms({ series: {}, stations: [], params: [], loading: false, error: e.message || 'Failed to load WMS data' })
+      setWms({ series: {}, stations: [], params: [], loading: false,
+               error: e.message || 'Failed to load WMS data', range: { from: f, to: t }, coverage: null })
     }
   }, [])
 
@@ -470,12 +482,20 @@ export default function Analytics() {
     }
   }, [])
 
-  // Load the WMS/PPC comparison whenever that type is selected and a range is set (initial
-  // switch + any From/To change). Inverter mode never triggers either.
+  // WMS comparison: load when the user SWITCHES to WMS. Date changes while WMS is showing
+  // are handled by the automatic date-refresh below (`onRefresh` reloads WMS), which is
+  // debounced and ignores incomplete/backwards ranges. This effect used to react to every
+  // From/To change as well, so each date edit fetched WMS twice — plus once more for the
+  // half-edited range when both dates changed. The latest From/To are read from this
+  // render, so the switch always uses the current selection.
   useEffect(() => {
-    if (equipmentType === 'WMS' && from && to) loadWmsCompare({ from, to })
+    if (equipmentType === 'WMS' && from && to && from <= to) loadWmsCompare({ from, to })
+  }, [equipmentType])  // eslint-disable-line react-hooks/exhaustive-deps
+
+  // PPC comparison — unchanged: loads on switching to PPC and on any From/To change.
+  useEffect(() => {
     if (equipmentType === 'PPC' && from && to) loadPpcCompare({ from, to })
-  }, [equipmentType, from, to, loadWmsCompare, loadPpcCompare])
+  }, [equipmentType, from, to, loadPpcCompare])
 
   // The one refresh routine: the Refresh button and the automatic date-change refresh
   // below both call THIS — there is no second implementation. Memoised so the effect can
@@ -515,6 +535,14 @@ export default function Analytics() {
   // dropdown it replaces did the same), without a redundant reload if already there.
   const onInvOpen = () => { if (equipmentType !== 'Inverter') onEquipmentType('Inverter') }
 
+  // WMS availability for the range actually loaded (from the rows the database returned).
+  // Only evaluated once a load has finished, so a loading/erroring page never flashes it.
+  const dmy = v => (v ? String(v).slice(0, 10).split('-').reverse().join('/') : '—')
+  const wmsSettled = !wms.loading && !wms.error && !!wms.coverage
+  const wmsNoData  = wmsSettled && wms.coverage.rows === 0
+  const wmsPartial = wmsSettled && wms.coverage.rows > 0 && !!wms.range &&
+    (wms.coverage.first > wms.range.from || wms.coverage.last < wms.range.to)
+
   const kpis = data?.kpis || {}
   const daily = data?.daily || []
   const monthly = data?.monthly || []
@@ -533,31 +561,127 @@ export default function Analytics() {
   // ── Export: PDF (KPIs + charts + tables) ───────────────────────────────────
   const exportPdf = async () => {
     if (!data) return
+    // Only export a range whose data has actually arrived. After a date change the page
+    // refreshes itself (debounced), so for a moment the inputs show the NEW dates while
+    // the charts still hold the old ones — exporting then would label old data with new
+    // dates. `loadedRangeRef` is the range the last load requested.
+    const viewLoading = loading
+      || (equipmentType === 'WMS' && wms.loading)
+      || (equipmentType === 'PPC' && ppc.loading)
+    if (viewLoading || loadedRangeRef.current !== `${from}|${to}`) {
+      showToast('Analytics is still refreshing for the selected dates — export again in a moment.', 'warn')
+      return
+    }
     setPdfBusy(true)
     try {
-      const shots = await Promise.all([
-        captureChartPng(refs.daily.current, { background: CHART_BG }),
-        captureChartPng(refs.monthly.current, { background: CHART_BG }),
-        captureChartPng(refs.top.current, { background: CHART_BG }),
-        captureChartPng(refs.pr.current, { background: CHART_BG }),
-      ])
-      const titles = ['Daily Generation Trend (MWh)', 'Monthly Generation Trend (MWh)',
-                      'Top 10 Inverters by Generation (kWh)', 'Plant Performance Ratio Trend (%)']
-      const charts = shots.map((s, i) => (s ? { ...s, title: titles[i] } : null)).filter(Boolean)
+      // En dash, not an arrow: jsPDF's built-in Helvetica has no arrow glyph (it prints "!'").
+      const period = `${dmy(from)} – ${dmy(to)}`
+      const invOptions = inverterOptions
+      const sel = invIds ? [...invIds] : invOptions
+      const invLabel = !sel.length ? 'None selected'
+        : sel.length === invOptions.length ? `All Inverters (${invOptions.length})`
+        : sel.length <= 3 ? sel.join(', ')
+        : `${sel.length} selected: ${sel.slice(0, 2).join(', ')} +${sel.length - 2} more`
+
+      // Page-1 facts: the filters this PDF was generated with, then the KPI summary —
+      // so every report states exactly which range/equipment/inverters it covers.
+      const meta = [
+        { label: 'Period', value: period },
+        { label: 'Equipment Type', value: equipmentType },
+        { label: 'Inverters', value: invLabel },
+        ...KPI_LAYOUT.map(({ key }) => ({
+          label: kpis[key]?.label || key,
+          value: `${fmt(kpis[key]?.value)} ${kpis[key]?.unit || ''}`.trim(),
+        })),
+      ]
+
+      // Every chart below is built from the SAME arrays the on-screen charts render
+      // (data.daily / monthly / pr_trend / inverters, wms.series, ppc.series) — no second
+      // query and no separate calculation, so the PDF can not disagree with the screen.
+      const lineSeries = (rows, lines) => lines.map(l => ({
+        name: l.label, color: l.color, width: l.width, values: rows.map(r => r[l.key]),
+      }))
+      let charts = []
+      let notice = null
+      let tables = []
+
+      if (equipmentType === 'WMS') {
+        if (wmsNoData) {
+          notice = { text: 'No WMS data available for the selected date range.', detail: period }
+        } else {
+          if (wmsPartial) {
+            notice = {
+              text: `WMS records in the selected range cover ${dmy(wms.coverage.first)} – ${dmy(wms.coverage.last)}`,
+              detail: `Selected range: ${period}`,
+            }
+          }
+          const lines = cmpLines([{ key: 'avg', label: 'Average WMS' },
+            ...wms.stations.map(st => ({ key: `s${st}`, label: `WMS${st}` }))])
+          charts = (wms.params || []).map(p => {
+            const rows = wms.series?.[p.key] || []
+            return { vector: {
+              type: 'line', title: `WMS ${p.label} — Average vs Stations (${p.unit})`,
+              xLabel: 'Date', yLabel: `${p.label} (${p.unit})`,
+              categories: rows.map(r => r.t), series: lineSeries(rows, lines),
+            } }
+          })
+        }
+      } else if (equipmentType === 'PPC') {
+        charts = (ppc.groups || []).map(g => {
+          const rows = ppc.series?.[g.key] || []
+          return { vector: {
+            type: 'line', title: `PPC ${g.title} (${g.unit})`,
+            xLabel: 'Date', yLabel: `${g.title} (${g.unit})`,
+            categories: rows.map(r => r.t), series: lineSeries(rows, cmpLines(g.series)),
+          } }
+        })
+        if (!charts.length || !charts.some(c => specHasData(c.vector))) {
+          notice = { text: 'No PPC data available for the selected date range.', detail: period }
+          charts = []
+        }
+      } else {
+        charts = [
+          { vector: {
+            type: 'area', title: 'Daily Generation Trend (MWh)', xLabel: 'Date', yLabel: 'Generation (MWh)',
+            categories: daily.map(r => r.label),
+            series: [{ name: 'Generation', color: C.blue, width: 2, values: daily.map(r => r.generation_mwh) }],
+          } },
+          { vector: {
+            type: 'bar', title: 'Monthly Generation Trend (MWh)', xLabel: 'Month', yLabel: 'Generation (MWh)',
+            categories: monthly.map(r => r.label), valueLabels: true, valueDecimals: 1,
+            series: [{ name: 'Generation', color: C.blue, values: monthly.map(r => r.generation_mwh) }],
+          } },
+          { vector: {
+            type: 'hbar', title: 'Top 10 Inverters by Generation (kWh)', xLabel: 'Generation (kWh)',
+            categories: top10.map(r => r.inverter), valueLabels: true, valueDecimals: 0,
+            series: [{ name: 'Generation', color: C.blue, values: top10.map(r => r.generation_kwh) }],
+          } },
+          { vector: {
+            type: 'line', title: 'Plant Performance Ratio Trend (%)', xLabel: 'Date', yLabel: 'PR (%)',
+            yMin: 0, yMax: 100, categories: prTrend.map(r => r.label),
+            series: [{ name: 'PR', color: C.blue, width: 2, values: prTrend.map(r => r.pr) }],
+          } },
+        ]
+        if (!sel.length) {
+          notice = { text: 'No inverters selected.', detail: 'Select at least one inverter to include inverter analytics.' }
+          charts = []
+        } else if (!charts.some(c => specHasData(c.vector))) {
+          notice = { text: 'No data available for the selected date range.', detail: period }
+          charts = []
+        } else {
+          tables = [
+            { title: 'Top Performing Inverters', columns: pdfPerfCols, rows: topTable },
+            { title: 'Lowest Performing Inverters', columns: pdfPerfCols, rows: lowTable },
+          ]
+        }
+      }
+
       buildReportPdf({
         filename: `Analytics_Report_${todayName()}.pdf`,
         plant: PLANT_NAME,
         reportTitle: 'Plant Analytics Report',
-        subtitle: rangeLabel,
-        meta: KPI_LAYOUT.map(({ key }) => ({
-          label: kpis[key]?.label || key,
-          value: `${fmt(kpis[key]?.value)} ${kpis[key]?.unit || ''}`.trim(),
-        })),
-        charts,
-        tables: [
-          { title: 'Top Performing Inverters', columns: pdfPerfCols, rows: topTable },
-          { title: 'Lowest Performing Inverters', columns: pdfPerfCols, rows: lowTable },
-        ],
+        subtitle: period,
+        meta, notice, charts, tables,
       })
       showToast('PDF exported')
     } catch (e) {
@@ -608,7 +732,8 @@ export default function Analytics() {
     <div>
       <PageHeader title="Analytics & Performance">
         <button className="btn btn-outline btn-sm" onClick={exportExcel} disabled={busy || !data}>📗 Excel</button>
-        <button className="btn btn-primary btn-sm" onClick={exportPdf} disabled={busy || !data}>
+        <button className="btn btn-primary btn-sm" onClick={exportPdf}
+          disabled={busy || !data || (equipmentType === 'WMS' && wms.loading) || (equipmentType === 'PPC' && ppc.loading)}>
           {pdfBusy ? <><Spinner size={12} /> PDF…</> : '📄 PDF'}
         </button>
       </PageHeader>
@@ -655,16 +780,44 @@ export default function Analytics() {
         /* WMS COMPARISON — Average WMS vs each station over the selected From/To period.
            Replaces the inverter charts & tables; no inverter data is shown in WMS mode. */
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-3 mb-3">
-          {(wms.params || []).map((p, i) => (
-            <CompareChart key={p.key} ref={wmsRefs[i]}
-              title={`WMS ${p.label} — Average vs Stations (${p.unit})`} unit={p.unit}
-              data={wms.series?.[p.key] || []}
-              lines={cmpLines([{ key: 'avg', label: 'Average WMS' },
-                ...wms.stations.map(st => ({ key: `s${st}`, label: `WMS${st}` }))])}
-              loading={wms.loading} error={wms.error} />
-          ))}
-          {!wms.loading && !wms.error && !(wms.params || []).length && (
-            <div className="card py-8 text-center text-[12px] text-ge-text3">No WMS data available</div>
+          {wmsNoData ? (
+            /* The database has NO WMS records in the selected range. One clear message,
+               spanning the chart grid, instead of four blank charts that look like a
+               failure — the charts return automatically as soon as the range contains
+               WMS data (the date change refreshes the page by itself). */
+            <div className="card lg:col-span-2 py-10 text-center">
+              <div className="text-[13px] text-ge-text1 font-medium">
+                No WMS data available for the selected date range.
+              </div>
+              <div className="text-[11px] text-ge-text3 mt-1.5 font-mono">
+                {dmy(wms.range?.from)} → {dmy(wms.range?.to)}
+              </div>
+            </div>
+          ) : (
+            <>
+              {/* Partial overlap: some records exist, but not across the whole selection.
+                  The charts show exactly those records; this note says which days they
+                  cover, so a chart that starts late or ends early is not mistaken for
+                  missing data inside the WMS history. */}
+              {wmsPartial && (
+                <div className="lg:col-span-2 px-3 py-2 rounded border border-ge-border bg-ge-surface text-[11px] text-ge-text2">
+                  WMS records in the selected range cover{' '}
+                  <span className="font-mono text-ge-text1">{dmy(wms.coverage.first)} → {dmy(wms.coverage.last)}</span>
+                  {' '}(selected <span className="font-mono">{dmy(wms.range.from)} → {dmy(wms.range.to)}</span>).
+                </div>
+              )}
+              {(wms.params || []).map((p, i) => (
+                <CompareChart key={p.key} ref={wmsRefs[i]}
+                  title={`WMS ${p.label} — Average vs Stations (${p.unit})`} unit={p.unit}
+                  data={wms.series?.[p.key] || []}
+                  lines={cmpLines([{ key: 'avg', label: 'Average WMS' },
+                    ...wms.stations.map(st => ({ key: `s${st}`, label: `WMS${st}` }))])}
+                  loading={wms.loading} error={wms.error} />
+              ))}
+              {!wms.loading && !wms.error && !(wms.params || []).length && (
+                <div className="card py-8 text-center text-[12px] text-ge-text3">No WMS data available</div>
+              )}
+            </>
           )}
         </div>
       ) : equipmentType === 'PPC' ? (

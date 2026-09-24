@@ -1,5 +1,5 @@
 // src/components/Common/index.jsx
-import React from 'react'
+import React, { useEffect, useRef, useState } from 'react'
 import { useApp } from '../../utils/AppContext'
 
 // ── Spinner ──────────────────────────────────────────────────────────────────
@@ -161,17 +161,25 @@ export function ToastContainer() {
   const { toasts } = useApp()
   return (
     <div className="fixed bottom-4 right-4 z-50 flex flex-col gap-2">
-      {toasts.map(t => (
-        <div
-          key={t.id}
-          className="bg-ge-surface border border-ge-border border-l-2 border-l-ge-accent
-                     rounded-lg px-4 py-2.5 text-xs text-ge-text1 shadow-lg animate-in
-                     flex items-center gap-2 min-w-[220px]"
-        >
-          <span className="text-ge-accent text-sm">✓</span>
-          {t.msg}
-        </div>
-      ))}
+      {toasts.map(t => {
+        // showToast has always carried a `type`; it was previously ignored, so a
+        // failure was announced with a green tick. An 'error' toast now reads as one.
+        const err = t.type === 'error'
+        return (
+          <div
+            key={t.id}
+            className={`bg-ge-surface border border-ge-border border-l-2 rounded-lg px-4 py-2.5
+                        text-xs text-ge-text1 shadow-lg animate-in flex items-center gap-2
+                        min-w-[220px] max-w-[360px] ${
+                          err ? 'border-l-ge-danger' : 'border-l-ge-accent'}`}
+          >
+            <span className={`text-sm ${err ? 'text-ge-danger' : 'text-ge-accent'}`}>
+              {err ? '✕' : '✓'}
+            </span>
+            {t.msg}
+          </div>
+        )
+      })}
     </div>
   )
 }
@@ -205,6 +213,175 @@ export function Modal() {
     </div>
   )
 }
+
+// ── Dialog shell ──────────────────────────────────────────────────────────────
+/**
+ * The shared frame for every in-app dialog — overlay, card, header, body, footer.
+ * It exists so the confirm and prompt dialogs below (and anything added later) look
+ * identical and behave identically without the markup being copied a third time.
+ *
+ * Escape, the ✕ and a backdrop click all close it, and all three are inert while
+ * `busy`, so a dialog cannot be dismissed out from under an in-flight request.
+ */
+export function Dialog({ open, title, onClose, busy = false, children, footer, titleId = 'dialog-title' }) {
+  useEffect(() => {
+    if (!open) return
+    const onKey = e => { if (e.key === 'Escape' && !busy) { e.stopPropagation(); onClose?.() } }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [open, busy, onClose])
+
+  if (!open) return null
+
+  return (
+    <div
+      className="fixed inset-0 bg-black/70 z-50 flex items-center justify-center p-4"
+      onClick={e => { if (e.target === e.currentTarget && !busy) onClose?.() }}
+      role="dialog" aria-modal="true" aria-labelledby={titleId}
+    >
+      <div className="bg-ge-card border border-ge-border rounded-xl w-[440px] max-w-full max-h-[90vh] overflow-y-auto">
+        <div className="flex items-center justify-between px-4 py-3.5 border-b border-ge-border">
+          <span id={titleId} className="text-[14px] font-semibold text-ge-text1">{title}</span>
+          <button type="button" onClick={() => !busy && onClose?.()} disabled={busy} aria-label="Close"
+            className="text-ge-text3 hover:text-ge-text1 text-lg leading-none disabled:opacity-40">✕</button>
+        </div>
+        <div className="p-4 text-[12px] text-ge-text2 leading-relaxed">{children}</div>
+        <div className="flex flex-wrap justify-end gap-2 px-4 py-3 border-t border-ge-border">{footer}</div>
+      </div>
+    </div>
+  )
+}
+
+// ── Confirm dialog ────────────────────────────────────────────────────────────
+/**
+ * In-app confirmation for an action that cannot be undone — replaces
+ * window.confirm(), which shows the browser's "localhost:5173 says" chrome.
+ *
+ * Focus moves to Cancel on open, so a stray Enter cancels and can never trigger the
+ * destructive action. While `busy` every control is disabled, so it cannot fire twice.
+ */
+export function ConfirmDialog({
+  open, title, children,
+  confirmLabel = 'Confirm', cancelLabel = 'Cancel', busyLabel = 'Working…',
+  // Destructive by default; pass 'btn-primary' for a confirmation that is not a
+  // deletion, so the colour still tells the user what kind of action it is.
+  confirmClass = 'btn-danger',
+  onConfirm, onCancel, busy = false,
+}) {
+  const cancelRef = useRef(null)
+  useEffect(() => { if (open) cancelRef.current?.focus() }, [open])
+
+  return (
+    <Dialog open={open} title={title} onClose={onCancel} busy={busy} titleId="confirm-dialog-title"
+      footer={<>
+        <button ref={cancelRef} type="button" className="btn btn-outline btn-sm"
+          onClick={() => onCancel?.()} disabled={busy}>
+          {cancelLabel}
+        </button>
+        <button type="button" className={`btn ${confirmClass} btn-sm`}
+          onClick={() => onConfirm?.()} disabled={busy}>
+          {busy ? <><Spinner size={12} /> {busyLabel}</> : confirmLabel}
+        </button>
+      </>}
+    >
+      {children}
+    </Dialog>
+  )
+}
+
+// ── Prompt dialog ─────────────────────────────────────────────────────────────
+/**
+ * In-app single-field prompt — replaces window.prompt().
+ *
+ * The CALLER owns validation: `validate(trimmedValue)` returns an error string to
+ * block submission, or null/'' to allow it. That keeps store-specific rules (unique
+ * names, length limits) where they belong while the dialog stays generic.
+ *
+ * Behaviour:
+ *  · The input is focused and its text selected on open, so typing replaces it.
+ *  · Enter submits, but only when the value passes `validate` — it is a real <form>,
+ *    so the browser's own submit handling applies.
+ *  · The value is TRIMMED before validation and before it reaches onSubmit.
+ *  · Escape / ✕ / backdrop / Cancel all close without submitting.
+ *  · While `busy` every control is disabled, so the request cannot be sent twice.
+ *
+ * @param {string}   initialValue  pre-filled (and re-filled each time it opens)
+ * @param {function} validate      (trimmed) => error string | null
+ * @param {function} onSubmit      (trimmed) => void
+ */
+export function PromptDialog({
+  open, title, label, description,
+  initialValue = '', placeholder = '',
+  submitLabel = 'Save', cancelLabel = 'Cancel', busyLabel = 'Saving…',
+  validate, onSubmit, onCancel, busy = false, error = '',
+}) {
+  const [value, setValue] = useState(initialValue)
+  const [touched, setTouched] = useState(false)
+  const inputRef = useRef(null)
+
+  // Re-seed every time the dialog opens so it always shows the CURRENT name, never
+  // whatever was typed the last time it was open.
+  useEffect(() => {
+    if (!open) return
+    setValue(initialValue)
+    setTouched(false)
+    // The input is already committed to the DOM by the time this effect runs, so it
+    // can be focused directly. A 0ms retry covers the case where something else
+    // claims focus in the same tick (a still-mounted trigger button, for instance);
+    // a rAF would not, because it does not fire while the tab is hidden.
+    const focus = () => { inputRef.current?.focus(); inputRef.current?.select() }
+    focus()
+    const id = setTimeout(focus, 0)
+    return () => clearTimeout(id)
+  }, [open, initialValue])
+
+  const trimmed  = value.trim()
+  const invalid  = validate ? validate(trimmed) : null
+  const canSubmit = !busy && !invalid
+
+  const submit = e => {
+    e?.preventDefault()
+    setTouched(true)
+    if (!canSubmit) return
+    onSubmit?.(trimmed)
+  }
+
+  // Show a validation message only once the user has engaged, so the dialog does not
+  // open already complaining that the unchanged name is unchanged.
+  const shown = error || (touched && invalid) || ''
+
+  return (
+    <Dialog open={open} title={title} onClose={onCancel} busy={busy} titleId="prompt-dialog-title"
+      footer={<>
+        <button type="button" className="btn btn-outline btn-sm"
+          onClick={() => onCancel?.()} disabled={busy}>
+          {cancelLabel}
+        </button>
+        <button type="submit" form="prompt-dialog-form" className="btn btn-primary btn-sm"
+          disabled={!canSubmit}>
+          {busy ? <><Spinner size={12} /> {busyLabel}</> : submitLabel}
+        </button>
+      </>}
+    >
+      <form id="prompt-dialog-form" onSubmit={submit}>
+        {description}
+        <label className="form-label mt-3 block" htmlFor="prompt-dialog-input">{label}</label>
+        <input
+          id="prompt-dialog-input" ref={inputRef} type="text" className="form-control w-full"
+          value={value} placeholder={placeholder} disabled={busy}
+          onChange={e => { setValue(e.target.value); setTouched(true) }}
+          aria-invalid={!!shown} aria-describedby={shown ? 'prompt-dialog-error' : undefined}
+        />
+        {shown && (
+          <div id="prompt-dialog-error" role="alert" className="mt-1.5 text-[11px] text-ge-danger">
+            {shown}
+          </div>
+        )}
+      </form>
+    </Dialog>
+  )
+}
+
 
 // ── Progress Bar ──────────────────────────────────────────────────────────────
 export function ProgressBar({ value, max = 100, color = '#00d4aa', label, sublabel }) {

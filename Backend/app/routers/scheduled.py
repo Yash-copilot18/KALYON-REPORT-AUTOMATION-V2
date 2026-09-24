@@ -20,6 +20,7 @@ Endpoints:
   POST   /scheduled/schedules/{id}/pause         pause (skip automatic runs)
   POST   /scheduled/schedules/{id}/resume        resume
   GET    /scheduled/schedules/{id}/runs          execution history
+  POST   /scheduled/generate-send                ONE-OFF generate + e-mail (saves nothing)
 """
 
 import logging
@@ -216,11 +217,98 @@ def delete_schedule(schedule_id: int, db: Session = Depends(get_db)) -> Dict:
     return {"deleted": schedule_id}
 
 
+def _validate_runnable(s) -> None:
+    """
+    Gate a manual send of a SAVED schedule.
+
+    The automatic scheduler is untouched by this: it keeps running every schedule it
+    owns exactly as before. This only refuses to start a manual send that cannot
+    succeed, so the caller gets a precise reason instead of a failure logged minutes
+    later.
+    """
+    if not (s.equipment_type or "").strip():
+        raise HTTPException(400, detail="This schedule has no report type.")
+    if not schedule_service.is_supported_type(s.equipment_type):
+        raise HTTPException(400, detail=f"Unsupported report type: {s.equipment_type}.")
+    if not schedule_service.is_plant_level(s.equipment_type) and not (s.equipment_id or "").strip():
+        raise HTTPException(400, detail="This schedule has no equipment identifier.")
+    if not (s.frequency or "").strip():
+        raise HTTPException(400, detail="This schedule has no frequency configured.")
+
+    recipients = schedule_service.recipients_for(s)
+    if not recipients:
+        raise HTTPException(400, detail="This schedule has no recipient e-mail address.")
+    bad = schedule_service.invalid_recipients(recipients)
+    if bad:
+        raise HTTPException(400, detail="Invalid recipient e-mail address: " + ", ".join(bad))
+    _require_email_config()
+
+
 @router.post("/schedules/{schedule_id}/run")
 def run_schedule(schedule_id: int, db: Session = Depends(get_db)) -> Dict:
-    res = schedule_service.run_schedule_now(db, schedule_id)
-    if res is None:
+    """
+    Generate a SAVED schedule's report now and e-mail it to all of its recipients.
+
+    Runs the same schedule_service.execute_schedule the background scheduler calls,
+    so there is no second, manual-only report implementation.
+    """
+    s = schedule_service.get_schedule(db, schedule_id)
+    if not s:
         raise HTTPException(404, detail="Schedule not found")
+    _validate_runnable(s)
+
+    logger.info("Manual run requested for schedule id=%s (%s/%s)",
+                s.id, s.equipment_type, s.equipment_id)
+    res = schedule_service.execute_schedule(db, s, kind="RUN")
+    logger.info("Manual run finished for schedule id=%s -> %s", s.id, res.get("status"))
+    return res
+
+
+def _validate_adhoc(payload: SchedulePayload) -> List[str]:
+    """
+    Validate a ONE-OFF Generate & Send described by the Create-Schedule form, and
+    return the resolved recipient list.
+
+    Every field the report needs is checked here, not only in the browser, so the
+    endpoint cannot be driven into generating a report from an incomplete request.
+    Each message names the single field to fix, so the UI can show it inline.
+    """
+    _validate_type(payload.eq_type)
+    if (not schedule_service.is_plant_level(payload.eq_type)
+            and not (payload.eq_id or "").strip()):
+        raise HTTPException(400, detail="Equipment identifier is required")
+    if not (payload.interval or "").strip():
+        raise HTTPException(400, detail="Time interval is required")
+    if not (payload.agg or "").strip():
+        raise HTTPException(400, detail="Aggregation is required")
+    if not (payload.format or "").strip():
+        raise HTTPException(400, detail="Report format is required")
+    if not (payload.from_ or "").strip():
+        raise HTTPException(400, detail="Report date is required")
+
+    _validate_recipients(payload)                     # rejects malformed addresses
+    recipients = schedule_service.normalize_recipients(payload.recipients)
+    if not recipients:
+        raise HTTPException(400, detail="At least one recipient e-mail address is required")
+
+    _require_email_config()
+    return recipients
+
+
+@router.post("/generate-send")
+def generate_and_send(payload: SchedulePayload, db: Session = Depends(get_db)) -> Dict:
+    """
+    ONE-OFF manual report: generate what the form describes and e-mail it now.
+
+    This is NOT a scheduling action - no ReportSchedule is created, no ScheduleRun is
+    written and no next_run is set, so nothing appears in the Report Schedules list.
+    Generation and delivery go through the SAME service the scheduler uses.
+    """
+    _validate_adhoc(payload)
+    logger.info("Ad-hoc Generate & Send requested -> %s/%s | fmt=%s",
+                payload.eq_type, payload.eq_id, payload.format)
+    res = schedule_service.generate_and_send_adhoc(db, payload.as_dict())
+    logger.info("Ad-hoc Generate & Send finished -> %s", res.get("status"))
     return res
 
 

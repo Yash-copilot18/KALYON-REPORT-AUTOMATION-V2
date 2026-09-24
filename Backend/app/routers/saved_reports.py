@@ -13,6 +13,7 @@ into the existing Reports page and using its existing Load Data / Export paths.
 
 Endpoints:
   GET    /saved-reports          list all saved reports (newest first)
+  GET    /saved-reports/count    current saved-template count vs the maximum
   POST   /saved-reports          create a saved report
   GET    /saved-reports/{id}     fetch one
   PUT    /saved-reports/{id}     update one
@@ -28,6 +29,7 @@ from sqlalchemy.orm import Session
 
 from app.database.session import get_db
 from app.services import saved_report_service
+from app.services.saved_report_service import SavedReportLimitError
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/saved-reports", tags=["Saved Reports"])
@@ -69,11 +71,23 @@ def list_saved_reports(db: Session = Depends(get_db)) -> List[Dict]:
             for s in saved_report_service.list_saved_reports(db)]
 
 
+# Declared BEFORE /{report_id} so "count" is not parsed as an id.
+@router.get("/count")
+def saved_report_capacity(db: Session = Depends(get_db)) -> Dict:
+    """Saved-template usage: {count, max, remaining, limit_reached, message}."""
+    return saved_report_service.capacity(db)
+
+
 @router.post("")
 def create_saved_report(payload: SavedReportPayload,
                         db: Session = Depends(get_db)) -> Dict:
     _validate(payload)
-    s = saved_report_service.create_saved_report(db, payload.as_dict())
+    try:
+        s = saved_report_service.create_saved_report(db, payload.as_dict())
+    except SavedReportLimitError as exc:
+        # 409 Conflict — the request is well-formed, the store is full. The cap is
+        # enforced here as well as in the UI, so a direct API call cannot exceed it.
+        raise HTTPException(409, detail=str(exc))
     return saved_report_service.to_row(s)
 
 

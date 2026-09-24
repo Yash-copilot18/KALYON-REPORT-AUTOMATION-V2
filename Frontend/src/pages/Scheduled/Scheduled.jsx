@@ -1,12 +1,13 @@
 // src/pages/Scheduled/Scheduled.jsx
 import React, { useState, useMemo, useEffect } from 'react'
-import { PageHeader, Spinner } from '../../components/Common'
+import { PageHeader, Spinner, ConfirmDialog } from '../../components/Common'
 import { useApp } from '../../utils/AppContext'
 import {
   fetchScheduledEmailConfig, sendTestEmail, fetchReportEquipmentList,
   fetchReportEquipmentTypes,
   fetchSchedules, createSchedule, updateSchedule, deleteSchedule,
-  runSchedule, pauseSchedule, resumeSchedule, fetchScheduleRuns,
+  pauseSchedule, resumeSchedule, fetchScheduleRuns,
+  generateAndSendReport,
 } from '../../services/api'
 import {
   INTERVALS, INTERVAL_LABELS, AGG_OPTIONS, DEFAULT_AGG,
@@ -153,6 +154,14 @@ function RecipientsInput({ value, onChange, fallback }) {
   )
 }
 
+// One inline validation message, shown under the field it belongs to. Replaces the
+// browser alert() the form used to raise, so a problem is pointed at the actual field.
+function FieldError({ children }) {
+  if (!children) return null
+  return <span role="alert" className="text-[10px] text-ge-danger">{children}</span>
+}
+
+
 function ScheduleForm({ initial, onSave, onCancel, recipient }) {
   const [form, setForm] = useState(
     initial
@@ -242,17 +251,77 @@ function ScheduleForm({ initial, onSave, onCancel, recipient }) {
 
   const preset = getPreset(form.eq_type)
 
+  const { showToast } = useApp()
+
+  // Field-level validation shared by Create Schedule and Generate & Send, so both
+  // judge the form by the same rules. Returns { field: message }; empty means valid.
+  // Messages are rendered inline under each field — never a browser alert().
+  const [errors, setErrors] = useState({})
+  const validate = () => {
+    const e = {}
+    const emails = splitRecipients(form.recipients)
+    const bad = emails.filter(v => !isEmail(v))
+    if (!form.eq_type.trim()) e.eq_type = 'Report type is required'
+    // A plant-level report (YGR) covers the whole plant and has no identifier.
+    if (form.eq_type && form.eq_type !== YGR_TYPE && !String(form.eq_id || '').trim())
+      e.eq_id = 'Equipment identifier is required'
+    if (!String(form.from || '').trim()) e.from = 'Report date is required'
+    if (!String(form.interval || '').trim()) e.interval = 'Time interval is required'
+    if (!String(form.agg || '').trim()) e.agg = 'Aggregation is required'
+    if (!String(form.format || '').trim()) e.format = 'Report format is required'
+    if (!emails.length) e.recipients = 'At least one recipient email is required'
+    else if (bad.length) e.recipients = `Invalid email address: ${bad.join(', ')}`
+    return e
+  }
+
   const handleSubmit = e => {
     e.preventDefault()
-    if (!form.eq_type.trim())  return alert('Report type required')
-    // Every chip must be a valid address and there must be at least one, so the
-    // schedule can never be saved with nobody (or a typo) to send to.
-    const emails = splitRecipients(form.recipients)
-    if (!emails.length)          return alert('At least one recipient email is required')
-    const bad = emails.filter(v => !isEmail(v))
-    if (bad.length)              return alert(`Invalid email address: ${bad.join(', ')}`)
-    onSave({ ...form, recipients: joinRecipients(emails) })
+    const found = validate()
+    setErrors(found)
+    if (Object.keys(found).length) return
+    onSave({ ...form, recipients: joinRecipients(splitRecipients(form.recipients)) })
   }
+
+  // ── Generate & Send — a ONE-OFF manual report, not a scheduling action ─────
+  // It creates no schedule and writes no run record: the backend builds the report
+  // the form describes and e-mails it immediately through the same service the
+  // scheduler uses. `confirming` drives the confirmation dialog; `sending` locks it.
+  const [confirming, setConfirming] = useState(false)
+  const [sending,    setSending]    = useState(false)
+
+  const askGenerate = () => {
+    const found = validate()
+    setErrors(found)
+    if (Object.keys(found).length) {
+      return showToast('Complete the highlighted fields before sending.', 'error')
+    }
+    setConfirming(true)
+  }
+
+  const doGenerate = async () => {
+    if (sending) return                       // blocks a duplicate send / duplicate email
+    setSending(true)
+    try {
+      const res = await generateAndSendReport({
+        ...form,
+        recipients: joinRecipients(splitRecipients(form.recipients)),
+      })
+      // The endpoint answers 200 even when the run FAILED, carrying status/error in
+      // the body — the status decides, so a failure is never reported as a success.
+      if (res?.status === 'Success') {
+        setConfirming(false)
+        showToast('Report generated and sent successfully.')
+      } else {
+        showToast(`Generate & Send failed: ${res?.error || 'unknown error'}`, 'error')
+      }
+    } catch (err) {
+      showToast(`Generate & Send failed: ${err.message}`, 'error')
+    } finally {
+      setSending(false)                       // the form values are left untouched
+    }
+  }
+
+  const recipientList = splitRecipients(form.recipients).join(', ')
 
   return (
     <form onSubmit={handleSubmit} className="space-y-3">
@@ -271,6 +340,7 @@ function ScheduleForm({ initial, onSave, onCancel, recipient }) {
               <option key={t} value={t}>{typeLabel(t)}</option>
             ))}
           </select>
+          <FieldError>{errors.eq_type}</FieldError>
         </div>
         <div className="flex flex-col gap-1">
           <label className="form-label">Equipment Identifier</label>
@@ -297,6 +367,7 @@ function ScheduleForm({ initial, onSave, onCancel, recipient }) {
               ))}
             </select>
           )}
+          <FieldError>{errors.eq_id}</FieldError>
         </div>
       </div>
 
@@ -326,6 +397,7 @@ function ScheduleForm({ initial, onSave, onCancel, recipient }) {
           <span className="text-[10px] text-ge-text3">
             The single date the scheduled report is generated for.
           </span>
+          <FieldError>{errors.from}</FieldError>
         </div>
       </div>
 
@@ -340,6 +412,7 @@ function ScheduleForm({ initial, onSave, onCancel, recipient }) {
               <option key={v} value={v}>{INTERVAL_LABELS[v]}</option>
             ))}
           </select>
+          <FieldError>{errors.interval}</FieldError>
         </div>
         {showsAggregation(form.interval) && (
           <div className="flex flex-col gap-1">
@@ -350,6 +423,7 @@ function ScheduleForm({ initial, onSave, onCancel, recipient }) {
                 <option key={o.value} value={o.value}>{o.label}</option>
               ))}
             </select>
+            <FieldError>{errors.agg}</FieldError>
           </div>
         )}
       </div>
@@ -361,6 +435,7 @@ function ScheduleForm({ initial, onSave, onCancel, recipient }) {
             onChange={e => set('format', e.target.value)}>
             {FORMAT_OPTIONS.map(f => <option key={f}>{f}</option>)}
           </select>
+          <FieldError>{errors.format}</FieldError>
         </div>
         <div className="flex flex-col gap-1">
           <label className="form-label">Schedule Frequency *</label>
@@ -387,15 +462,54 @@ function ScheduleForm({ initial, onSave, onCancel, recipient }) {
         value={form.recipients}
         onChange={v => set('recipients', v)}
         fallback={recipient} />
+      <FieldError>{errors.recipients}</FieldError>
 
-      <div className="flex gap-2 pt-2 justify-end">
+      <div className="flex flex-wrap gap-2 pt-2 justify-end">
         <button type="button" className="btn btn-outline btn-sm" onClick={onCancel}>
           Cancel
+        </button>
+        {/* Generate & Send — sends THIS form's report now. It is not a scheduling
+            action: nothing is saved and no schedule row is created. */}
+        <button type="button" className="btn btn-outline btn-sm whitespace-nowrap"
+          onClick={askGenerate} disabled={sending}
+          title="Generate this report now and e-mail it to the recipients — nothing is saved">
+          {sending
+            ? <><Spinner size={10} /> Generating &amp; Sending…</>
+            : <>✉ Generate &amp; Send</>}
         </button>
         <button type="submit" className="btn btn-primary btn-sm">
           {initial?.id ? '💾 Save Changes' : '+ Create Schedule'}
         </button>
       </div>
+
+      {/* Confirmation — the app's shared dialog, same component as the Preconfigured
+          Reports confirmations. */}
+      <ConfirmDialog
+        open={confirming}
+        title="Generate & Send Report?"
+        confirmLabel="Generate & Send"
+        confirmClass="btn-primary"
+        busyLabel="Generating &amp; Sending…"
+        busy={sending}
+        onCancel={() => { if (!sending) setConfirming(false) }}
+        onConfirm={doGenerate}
+      >
+        <dl className="grid grid-cols-[100px_1fr] gap-x-3 gap-y-1.5">
+          <dt className="text-ge-text3">Report Type</dt>
+          <dd className="text-ge-text1 break-words">{typeLabel(form.eq_type)}</dd>
+          <dt className="text-ge-text3">Equipment</dt>
+          <dd className="text-ge-text1 break-words">
+            {form.eq_type === YGR_TYPE ? 'Plant-level (no equipment identifier)' : form.eq_id}
+          </dd>
+          <dt className="text-ge-text3">Format</dt>
+          <dd className="text-ge-text1">{form.format}</dd>
+          <dt className="text-ge-text3">Recipients</dt>
+          <dd className="text-ge-text1 break-words">{recipientList}</dd>
+        </dl>
+        <p className="mt-3 text-ge-text3">
+          The report will be generated and sent immediately. No schedule will be created.
+        </p>
+      </ConfirmDialog>
     </form>
   )
 }
@@ -409,7 +523,6 @@ export default function Scheduled() {
   const [loading,   setLoading]   = useState(true)
   const [showForm,  setShowForm]  = useState(false)
   const [editItem,  setEditItem]  = useState(null)
-  const [running,   setRunning]   = useState(new Set())
   const [filter,    setFilter]    = useState('All')
   const [search,    setSearch]    = useState('')
   const [histItem,  setHistItem]  = useState(null)
@@ -507,25 +620,6 @@ export default function Scheduled() {
       await loadSchedules()
     } catch (e) {
       showToast(`⚠ Update failed: ${e.message}`)
-    }
-  }
-
-  // Run a schedule now: backend loads it from the DB, generates the real report,
-  // e-mails it, logs the run, and updates Last Run / Next Run.
-  const handleRun = async id => {
-    setRunning(prev => new Set([...prev, id]))
-    try {
-      const res = await runSchedule(id)
-      if (res?.status === 'Success') {
-        showToast(`Report e-mailed to ${res.recipient}`)
-      } else {
-        showToast(`⚠ Email failed: ${res?.error || 'unknown error'}`)
-      }
-      await loadSchedules()
-    } catch (e) {
-      showToast(`⚠ Run failed: ${e.message}`)
-    } finally {
-      setRunning(prev => { const s = new Set(prev); s.delete(id); return s })
     }
   }
 
@@ -713,19 +807,6 @@ SMTP_FROM_EMAIL=your_gmail_address@gmail.com`}</pre>
                   </td>
                   <td className="whitespace-nowrap w-px">
                     <div className="flex items-center gap-1.5">
-                      {/* Run now */}
-                      <button
-                        className="btn btn-outline btn-sm"
-                        onClick={() => handleRun(s.id)}
-                        disabled={running.has(s.id) || s.status === 'Paused'}
-                        title="Run now"
-                      >
-                        {running.has(s.id)
-                          ? <Spinner size={10} />
-                          : '▶'
-                        }
-                      </button>
-
                       {/* Toggle */}
                       <button
                         className={`btn btn-sm ${s.status === 'Active' ? 'btn-outline' : 'btn-success'}`}
@@ -790,7 +871,7 @@ SMTP_FROM_EMAIL=your_gmail_address@gmail.com`}</pre>
               {history.length === 0 ? (
                 <tr>
                   <td colSpan={4} className="text-center text-ge-text3 py-6 text-[12px]">
-                    No executions yet — click ▶ to run this schedule
+                    No executions yet — click Generate &amp; Send to run this schedule
                   </td>
                 </tr>
               ) : history.map((h, i) => (
@@ -809,6 +890,7 @@ SMTP_FROM_EMAIL=your_gmail_address@gmail.com`}</pre>
           </table>
         </div>
       )}
+
     </div>
   )
 }
