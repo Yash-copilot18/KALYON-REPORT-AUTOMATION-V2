@@ -565,6 +565,23 @@ class ReportsRepository:
         return {"total_equipment": total, "tags": tags}
 
     @staticmethod
+    def data_window(db: Session, table: str):
+        """
+        The first and last timestamp actually stored for a device, as
+        (min, max) - (None, None) when the table is empty.
+
+        Used for diagnostics: when a report comes back with no rows, the log and the
+        error can say which range WAS requested and which range the device actually
+        holds, instead of just "No Data Available". Cheap (MIN/MAX over an indexed
+        column) and read-only. The table name is whitelisted exactly as every other
+        query here does; no value is interpolated.
+        """
+        if not _safe_name(table):
+            raise HTTPException(400, detail=f"Invalid table: {table!r}")
+        row = db.execute(text(f"SELECT MIN(TimeCol), MAX(TimeCol) FROM [{table}]")).first()
+        return (row[0], row[1]) if row else (None, None)
+
+    @staticmethod
     def count_report_rows(
         db: Session, table: str, from_datetime: str, to_datetime: str, interval: str
     ) -> int:

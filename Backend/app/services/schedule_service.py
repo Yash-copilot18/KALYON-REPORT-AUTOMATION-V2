@@ -22,10 +22,11 @@ from datetime import datetime, timedelta, date
 from typing import List, Optional, Dict
 
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.exc import StaleDataError
 
 from app.database.session import SessionLocal
 from app.models.schedules import ReportSchedule, ScheduleRun
-from app.services import email_service, intervals
+from app.services import email_service, intervals, mail_quota
 from app.services.report_files import PROJECT_NAME
 from app.services.report_pdf import build_pdf_bytes, build_pdf_report, PDF_MIME
 
@@ -81,6 +82,42 @@ PLANT_LEVEL_REPORT_TYPES = ("Yearly Generation",)
 def is_plant_level(equipment_type: Optional[str]) -> bool:
     """True when this report type has no equipment identifier by design."""
     return (equipment_type or "").strip() in PLANT_LEVEL_REPORT_TYPES
+
+
+# Which table's stored data bounds a report type. The three generation reports read
+# a fixed source that is NOT their equipment_id (an MGR schedule is registered against
+# INVERTER_MONTHLY_GEN but is computed from INVERTER_DAILY_GEN), so they are mapped
+# explicitly; every other type reads the device table named by its equipment_id.
+_REPORT_SOURCE_TABLE = {
+    "Daily Generation":   "PPC",                  # _build_dgr_file
+    "Monthly Generation": "INVERTER_DAILY_GEN",   # mgr_service
+    "Yearly Generation":  "PPC",                  # ygr_service
+}
+
+
+def source_table(s: ReportSchedule) -> str:
+    """The table whose first/last timestamp bounds this schedule's report."""
+    return (_REPORT_SOURCE_TABLE.get((s.equipment_type or "").strip())
+            or (s.equipment_id or "").strip())
+
+
+def data_window(db: Session, s: ReportSchedule):
+    """
+    (first, last) stored timestamp for this schedule's data source, or (None, None).
+
+    This is how "Till Now" is resolved: the To-date of a report comes from what the
+    DATABASE actually holds, read live on every run, so no date is ever hardcoded and
+    newly-ingested data is picked up automatically the next time the report runs.
+    """
+    from app.repositories.reports_repository import ReportsRepository
+    table = source_table(s)
+    if not table:
+        return (None, None)
+    try:
+        return ReportsRepository.data_window(db, table)
+    except Exception as exc:  # noqa: BLE001 - a missing/odd table must not break the run
+        logger.warning("data_window unavailable for [%s]: %s", table, exc)
+        return (None, None)
 
 
 def is_supported_type(equipment_type: Optional[str]) -> bool:
@@ -166,8 +203,14 @@ def to_row(s: ReportSchedule, *, fallback_recipient: str = "") -> Dict:
         "recipients": s.recipients or fallback_recipient or "",
         # Scheduled execution time-of-day (HH:MM) — carried in next_run's time part.
         "time":      s.next_run.strftime("%H:%M") if s.next_run else DEFAULT_SCHEDULE_TIME,
-        "last_run":  s.last_run.strftime(_FMT) if s.last_run else "",
-        "next_run":  s.next_run.strftime(_FMT) if s.next_run else "",
+        # Generated Time: when this schedule last actually PRODUCED and SENT a report.
+        # It is written only by a successful execution (see execute_schedule), whether
+        # that came from the scheduler or from a manual run, so creating or editing a
+        # schedule never fills it and an empty value means "never generated".
+        #
+        # next_run is deliberately NOT exposed. It is the scheduler's internal firing
+        # time, not a fact about the report, and the page no longer shows one.
+        "generated": s.last_run.strftime(_FMT) if s.last_run else "",
         "created":   s.created_at.strftime("%d/%m/%Y") if s.created_at else "",
     }
 
@@ -282,23 +325,6 @@ def delete_schedule(db: Session, schedule_id: int) -> bool:
     return True
 
 
-def set_status(db: Session, schedule_id: int, status: str) -> Optional[ReportSchedule]:
-    s = get_schedule(db, schedule_id)
-    if not s:
-        return None
-    s.status = "Paused" if status.lower() == "paused" else "Active"
-    # Resuming re-bases next_run so a long-paused schedule doesn't fire immediately,
-    # keeping the configured time-of-day. allow_today so resuming in the morning a
-    # schedule set for the evening still runs tonight rather than tomorrow.
-    if s.status == "Active" and (s.next_run is None or s.next_run < datetime.now()):
-        cur_time = s.next_run.strftime("%H:%M") if s.next_run else DEFAULT_SCHEDULE_TIME
-        s.next_run = compute_next_run(s.frequency, schedule_time=cur_time, allow_today=True)
-    db.commit()
-    db.refresh(s)
-    logger.info("Schedule %s -> %s", schedule_id, s.status)
-    return s
-
-
 def list_runs(db: Session, schedule_id: int, limit: int = 50) -> List[ScheduleRun]:
     return (db.query(ScheduleRun)
             .filter(ScheduleRun.schedule_id == schedule_id)
@@ -361,10 +387,25 @@ def _build_ygr_file(db: Session, s: ReportSchedule):
     """
     from app.services import ygr_service, report_excel
 
-    year = s.to_date.year if s.to_date else datetime.now().year
+    # "Till Now" -> the year of the latest stored timestamp, not the current system
+    # year, so the report is never generated for a year that holds no data.
+    # A YGR covers ONE year: the END of the requested range, so "Till Now" reports the
+    # latest year the data reaches rather than the current system year.
+    year = (s.to_date.year if s.to_date else resolve_range(db, s)[1].year)
     ygr  = ygr_service.get_yearly_report(db, int(year))
     rows = ygr.get("months", [])
     label_fn = lambda c: _YGR_LABELS.get(c, c)     # noqa: E731 — tiny local mapper
+
+    # Never e-mail an empty YGR (same rule as every other report type).
+    if not rows:
+        first, last = data_window(db, s)
+        have = (f"{first:%d/%m/%Y} to {last:%d/%m/%Y}" if first and last else "no data")
+        logger.error("[YGR] NO DATA | schedule=%s | year=%s | stored data: %s",
+                     getattr(s, "id", None), year, have)
+        raise ValueError(
+            f"No Data Available: no generation recorded for {year}. "
+            f"Stored data covers {have}. The report was not sent."
+        )
 
     fmt   = _normalize_format(s.report_format)
     stamp = datetime.now().strftime("%d-%m-%Y")
@@ -400,13 +441,22 @@ _MGR_DAY_COLS   = ["date", "generation"]
 _MGR_DAY_LABELS = {"date": "Date", "generation": "Generation (kWh)"}
 
 
-def _mgr_period(s: ReportSchedule) -> tuple:
+def _mgr_period(db: Session, s: ReportSchedule) -> tuple:
     """
-    (month, year) for an MGR schedule, taken from the schedule's To-date — the
-    reporting month chosen in the UI — falling back to the From-date, then the
-    current month. NEVER a hardcoded month/year (client requirement).
+    (month, year) for an MGR schedule: the schedule's To-date - the reporting month
+    chosen in the UI - falling back to the From-date.
+
+    With neither ("Till Now"), it is the month of the LATEST timestamp the database
+    holds, never the current system month: reporting on a month the plant has no data
+    for would produce an empty workbook. Never a hardcoded month/year.
     """
-    ref = s.to_date or s.from_date or date.today()
+    # An MGR covers ONE month: the END of the requested range. With "Till Now" that is
+    # the latest month the data reaches - not the From-month, and never the system
+    # month, which would report on a period the plant has no data for.
+    if s.to_date:
+        ref = s.to_date
+    else:
+        _start, ref = resolve_range(db, s)
     return ref.month, ref.year
 
 
@@ -424,7 +474,7 @@ def _build_mgr_file(db: Session, s: ReportSchedule):
     import calendar
     from app.services import mgr_service, report_excel
 
-    month, year = _mgr_period(s)
+    month, year = _mgr_period(db, s)
     period_from = datetime(year, month, 1)
     last_day    = calendar.monthrange(year, month)[1]
     period_to   = datetime(year, month, last_day, 23, 59, 59)
@@ -445,6 +495,22 @@ def _build_mgr_file(db: Session, s: ReportSchedule):
     inverters = payload.get("inverters", []) or []
     daily     = payload.get("daily", []) or []
     total     = payload.get("total_generation", 0.0) or 0.0
+
+    # Never e-mail an empty MGR: stop with the month asked for and the data actually
+    # held, the same rule every other report type follows.
+    #
+    # The test is `daily`, the report's actual rows. `inverters` is NOT a data signal:
+    # mgr_service returns a column per inverter whatever the month, so a month with no
+    # telemetry still comes back with 24 all-zero columns and would otherwise be sent.
+    if not daily:
+        first, last = data_window(db, s)
+        have = (f"{first:%d/%m/%Y} to {last:%d/%m/%Y}" if first and last else "no data")
+        logger.error("[MGR] NO DATA | schedule=%s | month=%s | stored data: %s",
+                     getattr(s, "id", None), month_label, have)
+        raise ValueError(
+            f"No Data Available: no generation recorded for {month_label}. "
+            f"Stored data covers {have}. The report was not sent."
+        )
 
     logger.info(
         "[MGR] Rows returned | inverters=%d | daily_rows=%d | total_generation=%.3f %s",
@@ -585,7 +651,9 @@ def _build_dgr_file(db: Session, s: ReportSchedule):
 
     # DGR is a single-day report. The day is the schedule's To-date (the date chosen in
     # the UI), fallback From-date, then today. NEVER hardcoded.
-    day     = s.to_date or s.from_date or date.today()
+    # DGR covers ONE day. With no date configured ("Till Now") that is the latest day
+    # the database actually holds - never the system date, which would be empty.
+    _start_d, day = resolve_range(db, s)
     from_dt = datetime.combine(day, datetime.min.time())
     to_dt   = datetime.combine(day, datetime.max.time().replace(microsecond=0))
     interval = s.interval if s.interval in _VALID_INTERVALS else _DGR_DEFAULT_INTERVAL
@@ -621,12 +689,23 @@ def _build_dgr_file(db: Session, s: ReportSchedule):
 
     # ── Zero-row diagnostics (never silently emit an empty report) ────────────
     if not rows:
+        from app.repositories.reports_repository import ReportsRepository
+        first, last = ReportsRepository.data_window(db, "PPC")
+        have = (f"{first:%d/%m/%Y %H:%M} to {last:%d/%m/%Y %H:%M}"
+                if first and last else "no rows at all")
         logger.error(
-            "[DGR] NO DATA for %s: [dbo].[PPC] returned 0 rows via get_report_data "
-            "(tags=%s, interval=%s, agg=max) for [%s .. %s]. Likely cause: no PPC "
-            "telemetry stored for that date, or the schedule's To-date has no data.",
-            day.isoformat(), [_DGR_PPC_ENERGY, _DGR_PPC_POWER], interval,
-            from_dt.isoformat(), to_dt.isoformat(),
+            "[DGR] NO DATA | schedule=%s | for %s: [dbo].[PPC] returned 0 rows via "
+            "get_report_data (tags=%s, interval=%s, agg=max) for [%s .. %s] | "
+            "stored data: %s",
+            getattr(s, "id", None), day.isoformat(),
+            [_DGR_PPC_ENERGY, _DGR_PPC_POWER], interval,
+            from_dt.isoformat(), to_dt.isoformat(), have,
+        )
+        # Stop here rather than e-mail a workbook that only says "No Data Available".
+        raise ValueError(
+            f"No Data Available: [dbo].[PPC] has no records for {day:%d/%m/%Y} "
+            f"({interval}). Stored data covers {have}. "
+            "The report was not sent because it would have been empty."
         )
 
     fmt        = _normalize_format(s.report_format)
@@ -664,7 +743,39 @@ def _build_dgr_file(db: Session, s: ReportSchedule):
 _EQUIP_VALID_INTERVALS = {"raw", "1min", "5min", "15min", "30min", "hourly", "daily", "monthly"}
 
 
-def _build_equipment_file(db: Session, s: ReportSchedule):
+def resolve_range(db: Session, s: ReportSchedule):
+    """
+    The (start_date, end_date) a report actually covers.
+
+    · start = the schedule's From-date.
+    · end   = the schedule's To-date when one is set; otherwise "Till Now", which is
+              the LATEST timestamp the database currently holds for this report's
+              source - read live, never a hardcoded date, and never the system clock.
+
+    Requesting "Till Now" against a source with no data raises, so a report is never
+    silently generated for a range that cannot contain anything. Older single-date
+    schedules (from == to) are unaffected: they still cover exactly that one day.
+    """
+    first, last = data_window(db, s)
+
+    end_d = s.to_date or (last.date() if last else None)
+    if end_d is None:
+        raise ValueError(
+            f"No Data Available: [{source_table(s)}] holds no data, so there is no "
+            "latest date to report up to. The report was not sent."
+        )
+
+    start_d = s.from_date or (first.date() if first else end_d)
+    if start_d > end_d:
+        have = (f"{first:%d/%m/%Y} to {last:%d/%m/%Y}" if first and last else "no data")
+        raise ValueError(
+            f"No Data Available: nothing recorded for [{source_table(s)}] on or after "
+            f"{start_d:%d/%m/%Y}. Stored data covers {have}. The report was not sent."
+        )
+    return start_d, end_d
+
+
+def _build_equipment_file(db: Session, s: ReportSchedule, progress=None):
     """
     Generic equipment/report-type file for a schedule — generated through the SAME
     services a manual Reports export uses, so scheduled output matches manual output:
@@ -684,9 +795,10 @@ def _build_equipment_file(db: Session, s: ReportSchedule):
     if not eq_id:
         raise ValueError(f"Schedule id={s.id} ({s.equipment_type}) has no equipment identifier")
 
-    day     = s.to_date or s.from_date or date.today()
-    from_dt = datetime.combine(day, datetime.min.time())
-    to_dt   = datetime.combine(day, datetime.max.time().replace(microsecond=0))
+    start_d, end_d = resolve_range(db, s)
+    from_dt = datetime.combine(start_d, datetime.min.time())
+    to_dt   = datetime.combine(end_d, datetime.max.time().replace(microsecond=0))
+    day     = end_d                      # used for labels / filenames
     interval = s.interval if s.interval in _EQUIP_VALID_INTERVALS else "hourly"
     agg      = s.agg_function or "avg"
 
@@ -703,9 +815,38 @@ def _build_equipment_file(db: Session, s: ReportSchedule):
     )
 
     logger.info(
-        "[EQUIP] Generating | type=%s | equipment=%s | date=%s | interval=%s | agg=%s | tags=%d",
-        s.equipment_type, eq_id, day.isoformat(), interval, agg, len(tag_cols),
+        "[EQUIP] Generating | schedule=%s | type=%s | equipment=%s | date=%s | "
+        "from=%s | to=%s | interval=%s | agg=%s | tags=%d",
+        getattr(s, "id", None), s.equipment_type, eq_id, day.isoformat(),
+        from_dt.isoformat(), to_dt.isoformat(), interval, agg, len(tag_cols),
     )
+
+    # ── Row check BEFORE the file is built (client requirement) ──────────────
+    # A cheap bucket count over the very window the report will query. It answers the
+    # one question the attachment cannot: did the database actually return anything?
+    # Never emit - and never e-mail - a workbook that would only say "No Data
+    # Available"; fail with the exact window requested and the window the device
+    # really holds, so the cause is obvious from the run history and the log.
+    row_count = ReportsRepository.count_report_rows(
+        db, eq_id, from_dt.isoformat(sep=" "), to_dt.isoformat(sep=" "), interval)
+    logger.info("[EQUIP] Rows returned | schedule=%s | equipment=%s | rows=%d",
+                getattr(s, "id", None), eq_id, row_count)
+
+    if row_count == 0:
+        first, last = ReportsRepository.data_window(db, eq_id)
+        have = (f"{first:%d/%m/%Y %H:%M} to {last:%d/%m/%Y %H:%M}"
+                if first and last else "no rows at all")
+        logger.error(
+            "[EQUIP] NO DATA | schedule=%s | type=%s | equipment=[%s] | "
+            "requested [%s .. %s] interval=%s agg=%s -> 0 rows | stored data: %s",
+            getattr(s, "id", None), s.equipment_type, eq_id,
+            from_dt.isoformat(), to_dt.isoformat(), interval, agg, have,
+        )
+        raise ValueError(
+            f"No Data Available: [{eq_id}] has no records for "
+            f"{day:%d/%m/%Y} ({interval}). Stored data covers {have}. "
+            "The report was not sent because it would have been empty."
+        )
 
     fmt      = _normalize_format(s.report_format)
     stamp    = datetime.now().strftime("%d-%m-%Y")
@@ -740,15 +881,18 @@ def _build_equipment_file(db: Session, s: ReportSchedule):
 
     # ── Excel — dispatch to the type's specific builder (same as manual export) ──
     if s.equipment_type == "String Combiner":
-        from app.services.smb_excel import build_smb_workbook
-        out, filename, ctype = build_smb_workbook(db, req, [eq_id])
-        data = out.getvalue() if hasattr(out, "getvalue") else out
+        # The STREAMING entry point - identical output to build_smb_workbook (it is the
+        # same _smb_bytes underneath: one fetchmany-batched read per inverter, reused
+        # across that inverter's SMB sheets, constant-memory workbook) but it reports
+        # progress, so a long export can show real stages instead of a frozen spinner.
+        from app.services.smb_excel import generate_smb_workbook_streaming
+        data, filename, ctype = generate_smb_workbook_streaming(req, [eq_id], progress)
         main, _, sub = ctype.partition("/")
         return data, filename, main or XLSX_MIME[0], sub or XLSX_MIME[1]
 
     if s.equipment_type in ("Tracker", "T1 Isolation", "T2 Isolation"):
         from app.services.t1_isolation_excel import generate_t1_isolation_export
-        data, filename, ctype = generate_t1_isolation_export(req, [eq_id], None)
+        data, filename, ctype = generate_t1_isolation_export(req, [eq_id], progress)
         main, _, sub = ctype.partition("/")
         return data, filename, main or XLSX_MIME[0], sub or XLSX_MIME[1]
 
@@ -757,7 +901,7 @@ def _build_equipment_file(db: Session, s: ReportSchedule):
     return data, filename, XLSX_MIME[0], XLSX_MIME[1]
 
 
-def _build_report_file(db: Session, s: ReportSchedule):
+def _build_report_file(db: Session, s: ReportSchedule, progress=None):
     """
     Build the real report file for a schedule. Returns
     (data, filename, mime_main, mime_sub). Raises on failure (caller logs it).
@@ -777,11 +921,12 @@ def _build_report_file(db: Session, s: ReportSchedule):
         return _build_ygr_file(db, s)
     # Every other supported equipment/report type (Inverter, String Combiner, WMS, PPC,
     # Tracker, Alarms, …) → the SAME generic Reports export path used by manual exports.
-    return _build_equipment_file(db, s)
+    return _build_equipment_file(db, s, progress)
 
 
 def _generate_and_email(db: Session, s: ReportSchedule, t0: datetime,
-                        recipients: List[str], *, kind: str, label: str) -> Dict:
+                        recipients: List[str], *, kind: str, label: str,
+                        progress=None) -> Dict:
     """
     THE generation + e-mail step, shared by every path that sends a report.
 
@@ -797,9 +942,31 @@ def _generate_and_email(db: Session, s: ReportSchedule, t0: datetime,
     Returns {"ok": bool, "filename": str|None, "size": int|None, "error": str|None}.
     """
     fmt = _normalize_format(s.report_format)
-    logger.info("[%s] Generating %s -> %s/%s | fmt=%s | to=%d recipient(s) %s",
-                kind, label, s.equipment_type, s.equipment_id, fmt,
-                len(recipients), recipients)
+    window = (f"{s.from_date.isoformat() if s.from_date else 'current period'}"
+              f" .. {s.to_date.isoformat() if s.to_date else 'current period'}")
+    logger.info(
+        "[%s] Generating %s | type=%s | equipment=%s | window=%s | interval=%s | "
+        "agg=%s | fmt=%s | freq=%s | to=%d recipient(s) %s",
+        kind, label, s.equipment_type, s.equipment_id, window, s.interval,
+        s.agg_function, fmt, s.frequency, len(recipients), recipients,
+    )
+
+    def _tick(pct, msg):
+        if progress:
+            try: progress(pct, msg)
+            except Exception: pass   # progress reporting must never fail a send
+
+    # ── Mail quota ───────────────────────────────────────────────────────────
+    # Claimed here, in the single function EVERY send path funnels through, so a
+    # manual run, an ad-hoc send and the background scheduler are all bound by the
+    # same cap. The slot is held until this function returns and is given back when
+    # the send fails, so only delivered mail consumes the allowance.
+    try:
+        mail_quota.claim(db)
+    except mail_quota.MailQuotaExceeded as exc:
+        logger.info("[%s] %s refused -> %s", kind, label, exc)
+        return {"ok": False, "stage": "quota", "filename": None, "size": None,
+                "error": str(exc)}
 
     # Fail fast if SMTP isn't configured. Only the missing NAMES are reported.
     missing = email_service.get_missing_config()
@@ -807,14 +974,30 @@ def _generate_and_email(db: Session, s: ReportSchedule, t0: datetime,
         err = ("SMTP is not configured. Missing: " + ", ".join(missing)
                + ". Set them in Backend/.env (see .env.example).")
         logger.error("[%s] %s aborted -> %s", kind, label, err)
-        return {"ok": False, "filename": None, "size": None, "error": err}
+        mail_quota.release()
+        return {"ok": False, "stage": "config", "filename": None, "size": None, "error": err}
 
+    _tick(5, "Generating report...")
+    t_build = datetime.now()
     try:
-        data, filename, mime_main, mime_sub = _build_report_file(db, s)
+        # The heavy builders report their own progress; scale it into 5-75% so the
+        # remaining band belongs to the e-mail.
+        data, filename, mime_main, mime_sub = _build_report_file(
+            db, s, progress=lambda pct, msg: _tick(5 + int(pct * 0.70), msg))
+    except ValueError as e:
+        # A deliberate "no data for this period" stop, not a crash - reported as its
+        # own outcome so the UI can say so plainly instead of blaming generation.
+        err = str(e)
+        logger.error("[%s] %s -> %s", kind, label, err)
+        mail_quota.release()
+        return {"ok": False, "stage": "no_data", "filename": None, "size": None, "error": err}
     except Exception as e:  # noqa: BLE001
         err = f"Report generation failed: {type(e).__name__}: {e}"
         logger.error("[%s] %s -> %s", kind, label, err, exc_info=True)
-        return {"ok": False, "filename": None, "size": None, "error": err}
+        mail_quota.release()
+        return {"ok": False, "stage": "generate", "filename": None, "size": None, "error": err}
+    build_s = (datetime.now() - t_build).total_seconds()
+    logger.info("[%s] %s -> built %s (%d bytes) in %.2fs", kind, label, filename, len(data), build_s)
 
     subject = f"Kalyon Scheduled Report - {s.equipment_type}/{s.equipment_id} - {t0.strftime(_FMT)}"
     body = (
@@ -825,22 +1008,40 @@ def _generate_and_email(db: Session, s: ReportSchedule, t0: datetime,
         f"Generated : {t0.strftime(_FMT)}\n\n"
         "The requested report is attached.\n"
     )
+    _tick(80, "Sending email...")
+    t_mail = datetime.now()
     result = email_service.send_email_with_attachment(
         to_email=recipients, subject=subject, body=body,
         attachment_bytes=data, attachment_filename=filename,
         mime_main=mime_main, mime_sub=mime_sub,
     )
+    mail_s = (datetime.now() - t_mail).total_seconds()
+    logger.info("[%s] %s -> e-mail stage took %.2fs (build %.2fs, total %.2fs)",
+                kind, label, mail_s, build_s, build_s + mail_s)
     if result.get("success"):
-        logger.info("[%s] %s -> SUCCESS | %s | delivered to %d recipient(s)",
-                    kind, label, filename, len(recipients))
-        return {"ok": True, "filename": filename, "size": len(data), "error": None}
+        logger.info("[%s] %s -> EMAIL SENT | file=%s (%d bytes) | delivered to "
+                    "%d recipient(s) %s",
+                    kind, label, filename, len(data), len(recipients), recipients)
+        _tick(100, "Report generated and sent successfully.")
+        # The Success row written by the caller now holds this slot permanently.
+        mail_quota.release()
+        return {"ok": True, "stage": "sent", "filename": filename, "size": len(data),
+                "error": None, "build_seconds": round(build_s, 2),
+                "email_seconds": round(mail_s, 2)}
 
     err = result.get("error")
-    logger.error("[%s] %s -> email FAILED | %s", kind, label, err)
-    return {"ok": False, "filename": filename, "size": len(data), "error": err}
+    logger.error("[%s] %s -> EMAIL FAILED | file=%s (%d bytes) | %s",
+                 kind, label, filename, len(data), err)
+    # The report WAS generated - only delivery failed. Saying so is more useful than
+    # a blanket "generation failed". No mail went out, so the slot goes back.
+    mail_quota.release()
+    return {"ok": False, "stage": "email", "filename": filename, "size": len(data),
+            "error": f"Report generated, but email delivery failed: {err}",
+            "build_seconds": round(build_s, 2), "email_seconds": round(mail_s, 2)}
 
 
-def execute_schedule(db: Session, s: ReportSchedule, *, kind: str = "RUN") -> Dict:
+def execute_schedule(db: Session, s: ReportSchedule, *, kind: str = "RUN",
+                     progress=None) -> Dict:
     """
     Generate the real report, e-mail it, record a ScheduleRun, and advance
     last_run / next_run. Returns a status dict (also the Run-Now HTTP response).
@@ -859,14 +1060,54 @@ def execute_schedule(db: Session, s: ReportSchedule, *, kind: str = "RUN") -> Di
     def _finalize(status_str: str):
         run.status = status_str
         run.duration_ms = int((datetime.now() - t0).total_seconds() * 1000)
+
+        # The schedule may have been DELETED while the report was being generated and
+        # mailed - that can easily take a minute. Writing the timestamp (or the run
+        # row, which has a foreign key to it) would then fail with StaleDataError or an
+        # FK violation. Check first and report it plainly; the e-mail has already gone
+        # out, so this is reported as a completed send whose record could not be kept.
+        if db.query(ReportSchedule).filter(ReportSchedule.id == s.id).first() is None:
+            db.rollback()
+            logger.warning("Schedule id=%s was deleted while its report was being "
+                           "generated - no Generated Time recorded.", s.id)
+            return {
+                "status":         "Failed",
+                "execution_time": t0.strftime(_FMT),
+                "recipient":      recipient,
+                "report":         run.report,
+                "error":          ("The schedule was deleted while the report was being "
+                                   "generated, so no Generated Time was recorded."),
+            }
+
         db.add(run)
-        # Advance the clock regardless of success so a failing schedule doesn't
-        # hammer every tick; Run-Now also refreshes last_run for the UI. The
-        # configured time-of-day (from the current next_run) is carried forward.
         cur_time = s.next_run.strftime("%H:%M") if s.next_run else DEFAULT_SCHEDULE_TIME
-        s.last_run = t0
+
+        # last_run records a report that was actually generated AND delivered, so a
+        # failed attempt leaves it exactly as it was: the UI keeps showing the last
+        # real run (or nothing at all, if there has never been one).
+        if status_str == "Success":
+            s.last_run = t0
+
+        # next_run is the scheduler's own firing time and is advanced either way -
+        # a schedule that keeps failing must not be retried on every 60-second tick.
+        # It is not shown to the user until the schedule has actually executed once
+        # (see to_row), so advancing it here cannot display a misleading time.
         s.next_run = compute_next_run(s.frequency, base=t0, schedule_time=cur_time)
-        db.commit()
+        try:
+            db.commit()
+        except StaleDataError:
+            # Lost a race with a concurrent delete between the check above and here.
+            db.rollback()
+            logger.warning("Schedule id=%s vanished mid-commit - no Generated Time "
+                           "recorded.", s.id)
+            return {
+                "status":         "Failed",
+                "execution_time": t0.strftime(_FMT),
+                "recipient":      recipient,
+                "report":         run.report,
+                "error":          ("The schedule was deleted while the report was being "
+                                   "generated, so no Generated Time was recorded."),
+            }
         return {
             "status":         "Success" if status_str == "Success" else "Failed",
             "execution_time": t0.strftime(_FMT),
@@ -876,14 +1117,29 @@ def execute_schedule(db: Session, s: ReportSchedule, *, kind: str = "RUN") -> Di
         }
 
     outcome = _generate_and_email(db, s, t0, recipients,
-                                  kind=kind, label=f"schedule id={s.id}")
+                                  kind=kind, label=f"schedule id={s.id}",
+                                  progress=progress)
+
+    # A send refused by the mail cap never happened: nothing was generated, nothing
+    # was sent. Recording a Failed run would litter the history - once at the cap the
+    # scheduler would add a row for every schedule, every day - and advancing the
+    # clock would misrepresent an attempt that was never made.
+    if outcome.get("stage") == "quota":
+        return {
+            "status":         "Failed",
+            "execution_time": t0.strftime(_FMT),
+            "recipient":      recipient,
+            "report":         None,
+            "error":          outcome["error"],
+        }
+
     run.report    = outcome["filename"]
     run.file_size = outcome["size"]
     run.error     = outcome["error"]
     return _finalize("Success" if outcome["ok"] else "Failed")
 
 
-def generate_and_send_adhoc(db: Session, data: Dict) -> Dict:
+def generate_and_send_adhoc(db: Session, data: Dict, progress=None) -> Dict:
     """
     ONE-OFF "Generate & Send": build the report described by the form and e-mail it
     immediately. NOTHING is persisted - no ReportSchedule, no ScheduleRun, no clock
@@ -910,14 +1166,53 @@ def generate_and_send_adhoc(db: Session, data: Dict) -> Dict:
     recipients = _resolve_recipients(s)
 
     outcome = _generate_and_email(db, s, t0, recipients,
-                                  kind="ADHOC", label="ad-hoc send")
+                                  kind="ADHOC", label="ad-hoc send", progress=progress)
+
+    # Persist ONLY on success, and only after the e-mail actually went out: the row in
+    # Report Schedules represents a report that was generated and delivered, so a
+    # failed attempt leaves the database untouched. last_run is the Generated Time,
+    # written through the same field every other execution path uses.
+    saved_id = None
+    if outcome["ok"]:
+        s.next_run = compute_next_run(s.frequency, schedule_time=(data.get("time")
+                                      or DEFAULT_SCHEDULE_TIME), allow_today=False)
+        s.status   = "Active"
+        s.last_run = t0
+        db.add(s)
+        db.commit()
+        db.refresh(s)
+        saved_id = s.id
+        db.add(ScheduleRun(schedule_id=s.id, execution_time=t0, status="Success",
+                           report=outcome["filename"], file_size=outcome["size"],
+                           data_source="database", error=None,
+                           duration_ms=int((datetime.now() - t0).total_seconds() * 1000)))
+        db.commit()
+        logger.info("Ad-hoc send recorded -> schedule id=%s | generated=%s",
+                    s.id, t0.strftime(_FMT))
+
+    start_d, end_d = _last_resolved_range(db, s)
     return {
         "status":         "Success" if outcome["ok"] else "Failed",
+        "stage":          outcome.get("stage"),
+        "build_seconds":  outcome.get("build_seconds"),
+        "email_seconds":  outcome.get("email_seconds"),
         "execution_time": t0.strftime(_FMT),
+        "generated":      t0.strftime(_FMT) if outcome["ok"] else "",
+        "schedule_id":    saved_id,
+        "from":           start_d.strftime("%d/%m/%Y") if start_d else "",
+        "to":             end_d.strftime("%d/%m/%Y") if end_d else "",
         "recipient":      ", ".join(recipients),
         "report":         outcome["filename"],
         "error":          outcome["error"],
     }
+
+
+def _last_resolved_range(db: Session, s: ReportSchedule):
+    """The range the report covered, for the response - never raises."""
+    try:
+        return resolve_range(db, s)
+    except Exception:  # noqa: BLE001
+        return (s.from_date, s.to_date)
 
 
 def run_schedule_now(db: Session, schedule_id: int) -> Optional[Dict]:

@@ -105,6 +105,26 @@ def log_startup_status() -> bool:
     return True
 
 
+# Socket timeout for the SMTP conversation, in seconds.
+#
+# This is NOT a connect timeout - it bounds every socket operation, including the
+# upload of the attachment itself. A multi-megabyte workbook takes tens of seconds to
+# push to a provider like Gmail, so the old 30s value disconnected mid-send and the
+# report was never delivered however well it had been generated. 120s covers the
+# largest reports here with headroom; raise SMTP_TIMEOUT for slower uplinks.
+def _smtp_timeout() -> int:
+    raw = (os.getenv("SMTP_TIMEOUT") or "").strip()
+    if raw:
+        try:
+            value = int(raw)
+            if value > 0:
+                return value
+            logger.warning("SMTP_TIMEOUT=%s is not positive - using the default.", raw)
+        except ValueError:
+            logger.warning("SMTP_TIMEOUT=%s is not an integer - using the default.", raw)
+    return 120
+
+
 def send_email_with_attachment(
     to_email: Union[str, Sequence[str]],
     subject: str,
@@ -162,13 +182,14 @@ def send_email_with_attachment(
     try:
         if cfg["port"] == 465:
             context = ssl.create_default_context()
-            with smtplib.SMTP_SSL(cfg["host"], cfg["port"], timeout=30, context=context) as server:
+            with smtplib.SMTP_SSL(cfg["host"], cfg["port"], timeout=_smtp_timeout(),
+                                  context=context) as server:
                 logger.info("SMTP SSL connection established -> %s:%s", cfg["host"], cfg["port"])
                 server.login(cfg["username"], cfg["password"])
                 logger.info("SMTP authentication successful -> user=%s", cfg["username"])
                 server.send_message(msg)
         else:
-            with smtplib.SMTP(cfg["host"], cfg["port"], timeout=30) as server:
+            with smtplib.SMTP(cfg["host"], cfg["port"], timeout=_smtp_timeout()) as server:
                 server.ehlo()
                 server.starttls(context=ssl.create_default_context())
                 server.ehlo()

@@ -1,0 +1,56 @@
+# Repository-wide ignores.
+#
+# Backend/ and Frontend/ each keep their own .gitignore for tooling specific to them;
+# this covers the repository root and anything that could appear outside those two
+# folders. Nothing here removes files - it only keeps generated, local and secret
+# artefacts out of version control.
+
+# ── Secrets and local configuration ──────────────────────────────────────────
+.env
+.env.*
+!.env.example
+
+# ── Dependencies ─────────────────────────────────────────────────────────────
+node_modules/
+venv/
+.venv/
+env/
+
+# ── Python bytecode / caches ─────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ── Build output ─────────────────────────────────────────────────────────────
+dist/
+build/
+*.tsbuildinfo
+
+# ── Generated reports and scratch artefacts ──────────────────────────────────
+# Report exports are written to the user's Reports folder, never into the repo, but
+# a stray export or scratch file must never be committed by accident.
+Reports/
+exports/
+*.xlsx
+*.xlsm
+*.pdf
+!docs/**/*.pdf
+
+# ── Logs and temporary files ─────────────────────────────────────────────────
+logs/
+*.log
+*.tmp
+*.bak
+*.swp
+_t.*
+
+# ── OS / editor noise ────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/*
+!.vscode/extensions.json

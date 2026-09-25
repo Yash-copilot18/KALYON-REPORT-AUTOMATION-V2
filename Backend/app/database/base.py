@@ -31,4 +31,7 @@ class Base(DeclarativeBase):
 # Import all models here so Alembic can discover them for migrations.
 # Add new model imports below as you create them.
 def import_all_models():
-    from app.models import equipment  # noqa: F401
+    from app.models import equipment      # noqa: F401
+    from app.models import schedules      # noqa: F401
+    from app.models import saved_reports  # noqa: F401
+    from app.models import app_settings   # noqa: F401

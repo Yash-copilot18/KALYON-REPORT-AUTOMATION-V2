@@ -17,13 +17,17 @@ Endpoints:
   PUT    /scheduled/schedules/{id}               edit a schedule
   DELETE /scheduled/schedules/{id}               delete a schedule
   POST   /scheduled/schedules/{id}/run           Run Now (generate + e-mail + log)
-  POST   /scheduled/schedules/{id}/pause         pause (skip automatic runs)
-  POST   /scheduled/schedules/{id}/resume        resume
   GET    /scheduled/schedules/{id}/runs          execution history
-  POST   /scheduled/generate-send                ONE-OFF generate + e-mail (saves nothing)
+  GET    /scheduled/data-window                  first/last stored timestamp for a report
+  POST   /scheduled/generate-send                ONE-OFF generate + e-mail (synchronous)
+  POST   /scheduled/schedules/{id}/run/start     Generate & Send a SAVED schedule -> job id
+  POST   /scheduled/generate-send/start          ad-hoc generate + e-mail -> job id
+  GET    /scheduled/generate-send/status/{job}   progress + result of that job
+  GET    /scheduled/mail-quota                   mails sent against the 20-mail cap
 """
 
 import logging
+import threading
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Union
 
@@ -31,8 +35,8 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from app.database.session import get_db
-from app.services import email_service, schedule_service
+from app.database.session import get_db, SessionLocal
+from app.services import email_service, export_jobs, mail_quota, schedule_service
 from app.services.report_files import (
     build_excel_bytes, sample_report, PROJECT_NAME,
 )
@@ -283,8 +287,9 @@ def _validate_adhoc(payload: SchedulePayload) -> List[str]:
         raise HTTPException(400, detail="Aggregation is required")
     if not (payload.format or "").strip():
         raise HTTPException(400, detail="Report format is required")
-    if not (payload.from_ or "").strip():
-        raise HTTPException(400, detail="Report date is required")
+    # No report date is required: Scheduled Reports no longer collects one. When the
+    # payload carries none, the report builders generate for the current day / month /
+    # year, which is what a schedule run is expected to cover.
 
     _validate_recipients(payload)                     # rejects malformed addresses
     recipients = schedule_service.normalize_recipients(payload.recipients)
@@ -293,6 +298,149 @@ def _validate_adhoc(payload: SchedulePayload) -> List[str]:
 
     _require_email_config()
     return recipients
+
+
+@router.get("/data-window")
+def report_data_window(eq_type: str, eq_id: str = "",
+                       db: Session = Depends(get_db)) -> Dict:
+    """
+    The first and last timestamp this report type currently has data for.
+
+    The form uses it to resolve "Till Now" for display, so the confirmation shows the
+    range that will actually be generated. It is read live from the database on every
+    call, so newly-ingested data moves the window with no code or config change.
+    """
+    probe = schedule_service.ReportSchedule(equipment_type=eq_type, equipment_id=eq_id)
+    first, last = schedule_service.data_window(db, probe)
+    return {
+        "table":      schedule_service.source_table(probe),
+        "first":      first.strftime("%Y-%m-%d") if first else "",
+        "last":       last.strftime("%Y-%m-%d") if last else "",
+        "first_label": first.strftime("%d/%m/%Y") if first else "",
+        "last_label":  last.strftime("%d/%m/%Y") if last else "",
+        "has_data":   bool(first and last),
+    }
+
+
+@router.get("/mail-quota")
+def mail_quota_status(db: Session = Depends(get_db)) -> Dict:
+    """Mails sent against the cap: {count, max, remaining, limit_reached, message}."""
+    return mail_quota.status(db)
+
+
+def _require_mail_quota(db: Session) -> None:
+    """
+    Refuse to even START a send once the cap is reached.
+
+    This is a courtesy check so the user gets the message immediately instead of a job
+    that fails a second later; the binding enforcement is the claim inside
+    _generate_and_email, which also covers the background scheduler.
+    """
+    q = mail_quota.status(db)
+    if q["limit_reached"]:
+        raise HTTPException(409, detail=q["message"])
+
+
+def _start_job(runner, *, label: str) -> Dict:
+    """
+    Run `runner(db, on_progress)` on a worker thread and return its job id at once.
+
+    Shared by both Generate & Send entry points so a saved-schedule run and an ad-hoc
+    send behave identically: same registry, same progress shape, same status endpoint,
+    and neither holds the HTTP request open while a large export is built and mailed.
+    """
+    job_id = export_jobs.create_job()
+    export_jobs.update(job_id, status="running", progress=1, message="Queued...")
+
+    def _run():
+        # A worker thread needs its OWN session: the request's session is already
+        # closed by the time this runs.
+        db = SessionLocal()
+        try:
+            def on_progress(pct, msg):
+                export_jobs.update(job_id, status="running",
+                                   progress=max(1, min(99, int(pct))), message=str(msg))
+            res = runner(db, on_progress)
+            if res.get("status") == "Success":
+                export_jobs.update(job_id, status="done", progress=100,
+                                   message="Report generated and sent successfully.",
+                                   json_result=res, filename=res.get("report"))
+            else:
+                export_jobs.update(job_id, status="error", progress=100,
+                                   message=res.get("error") or "Generate & Send failed.",
+                                   error=res.get("error"), json_result=res)
+        except Exception as exc:  # noqa: BLE001 - a worker thread must never die silently
+            logger.error("%s job %s crashed: %s", label, job_id, exc, exc_info=True)
+            export_jobs.set_error(job_id, f"{type(exc).__name__}: {exc}")
+        finally:
+            db.close()
+
+    threading.Thread(target=_run, name=f"{label}-{job_id[:8]}", daemon=True).start()
+    return {"job_id": job_id, "status": "running"}
+
+
+@router.post("/schedules/{schedule_id}/run/start")
+def run_schedule_start(schedule_id: int, db: Session = Depends(get_db)) -> Dict:
+    """
+    Generate & Send an EXISTING schedule, in the background.
+
+    This is what updates that row's Generated Time: on success execute_schedule writes
+    the timestamp to the schedule itself, so the row the user clicked goes from "-" to
+    a real time. Nothing new is created. Validated before the job exists, so a
+    misconfigured schedule fails fast with a 400.
+    """
+    s = schedule_service.get_schedule(db, schedule_id)
+    if not s:
+        raise HTTPException(404, detail="Schedule not found")
+    _validate_runnable(s)
+    _require_mail_quota(db)
+    logger.info("Generate & Send (saved schedule id=%s) queued -> %s/%s",
+                s.id, s.equipment_type, s.equipment_id)
+
+    def _runner(worker_db, on_progress):
+        # Re-read inside the worker's own session; the outer one is gone.
+        row = schedule_service.get_schedule(worker_db, schedule_id)
+        if not row:
+            return {"status": "Failed", "error": "Schedule not found"}
+        return schedule_service.execute_schedule(worker_db, row, kind="RUN",
+                                                 progress=on_progress)
+
+    return _start_job(_runner, label="run-schedule")
+
+
+@router.post("/generate-send/start")
+def generate_and_send_start(payload: SchedulePayload,
+                            db: Session = Depends(get_db)) -> Dict:
+    """
+    Start a ONE-OFF Generate & Send in the background and return a job id at once.
+
+    Used by the Create New Schedule form for a configuration that is not saved yet; on
+    success the configuration is recorded so the report appears in the table with its
+    Generated Time. Validation runs BEFORE the job is created.
+    """
+    _validate_adhoc(payload)
+    _require_mail_quota(db)
+    data = payload.as_dict()
+    logger.info("Generate & Send (ad-hoc) queued -> %s/%s", payload.eq_type, payload.eq_id)
+    return _start_job(
+        lambda db, on_progress: schedule_service.generate_and_send_adhoc(
+            db, data, progress=on_progress),
+        label="gen-send")
+
+
+@router.get("/generate-send/status/{job_id}")
+def generate_and_send_status(job_id: str) -> Dict:
+    """Progress snapshot for a Generate & Send job, plus its result once finished."""
+    snap = export_jobs.status(job_id)
+    if snap is None:
+        raise HTTPException(404, detail="Job not found or expired")
+    result = export_jobs.get_json_result(job_id) or {}
+    out = {**snap, **{k: result.get(k) for k in
+                      ("generated", "from", "to", "schedule_id", "recipient",
+                       "report", "stage", "build_seconds", "email_seconds")}}
+    if snap["status"] in ("done", "error"):
+        export_jobs.cleanup(job_id)          # one-shot: the client has the outcome
+    return out
 
 
 @router.post("/generate-send")
@@ -310,23 +458,6 @@ def generate_and_send(payload: SchedulePayload, db: Session = Depends(get_db)) -
     res = schedule_service.generate_and_send_adhoc(db, payload.as_dict())
     logger.info("Ad-hoc Generate & Send finished -> %s", res.get("status"))
     return res
-
-
-@router.post("/schedules/{schedule_id}/pause")
-def pause_schedule(schedule_id: int, db: Session = Depends(get_db)) -> Dict:
-    s = schedule_service.set_status(db, schedule_id, "Paused")
-    if not s:
-        raise HTTPException(404, detail="Schedule not found")
-    return _row(db, s)
-
-
-@router.post("/schedules/{schedule_id}/resume")
-def resume_schedule(schedule_id: int, db: Session = Depends(get_db)) -> Dict:
-    _require_email_config()          # enabling is the other moment to surface this
-    s = schedule_service.set_status(db, schedule_id, "Active")
-    if not s:
-        raise HTTPException(404, detail="Schedule not found")
-    return _row(db, s)
 
 
 @router.get("/schedules/{schedule_id}/runs")

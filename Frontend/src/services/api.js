@@ -473,14 +473,35 @@ export const runSchedule = (id) =>
 // One-off "Generate & Send": build the report the Create-Schedule form describes and
 // e-mail it now. Saves NOTHING — no schedule, no run record — but generates and sends
 // through the same backend service the scheduler uses.
+// First/last timestamp the database currently holds for a report type, used to
+// resolve "Till Now" for display. Read live, so it follows newly-ingested data.
+export const fetchReportDataWindow = (eq_type, eq_id = '') =>
+  api.get('/api/v1/scheduled/data-window', { params: { eq_type, eq_id } })
+
 export const generateAndSendReport = (payload) =>
   api.post('/api/v1/scheduled/generate-send', payload)
 
-export const pauseSchedule = (id) =>
-  api.post(`/api/v1/scheduled/schedules/${id}/pause`)
+// Generate & Send, asynchronously. Building a large workbook and pushing a
+// multi-megabyte attachment through SMTP takes far longer than a browser request
+// should wait, so the work runs server-side as a job: start it, then poll.
+// `timeout: 0` on the poll is deliberate - these are tiny, fast calls, but the job
+// they describe may run for minutes and must never be cut short by the global 30s.
+// Generate & Send an EXISTING schedule in the background. On success the backend
+// stamps that schedule's Generated Time, so the row the user clicked updates in
+// place - nothing new is created. Poll it with fetchGenerateAndSendStatus.
+// Mails sent against the cap: { count, max, remaining, limit_reached, message }.
+// Read live from the backend, which is the source of truth - the UI never counts.
+export const fetchMailQuota = () =>
+  api.get('/api/v1/scheduled/mail-quota')
 
-export const resumeSchedule = (id) =>
-  api.post(`/api/v1/scheduled/schedules/${id}/resume`)
+export const startScheduleRun = (id) =>
+  api.post(`/api/v1/scheduled/schedules/${id}/run/start`)
+
+export const startGenerateAndSend = (payload) =>
+  api.post('/api/v1/scheduled/generate-send/start', payload)
+
+export const fetchGenerateAndSendStatus = (jobId) =>
+  api.get(`/api/v1/scheduled/generate-send/status/${jobId}`, { timeout: 0 })
 
 export const fetchScheduleRuns = (id) =>
   api.get(`/api/v1/scheduled/schedules/${id}/runs`)
