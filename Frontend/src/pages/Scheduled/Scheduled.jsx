@@ -604,14 +604,39 @@ export default function Scheduled() {
     }
   }
 
-  const handleDelete = async id => {
+  // ── Delete a schedule ─────────────────────────────────────────────────────
+  // Deleting a schedule ALSO deletes every run recorded against it (the backend
+  // removes its schedule_runs rows first, because they are foreign-keyed to it).
+  // That is irreversible report history, so it is confirmed first and the dialog
+  // says exactly how many runs will go with it - this action previously fired
+  // straight from the row button with no confirmation at all.
+  const [confirmDelete, setConfirmDelete] = useState(null)
+  const [deleting, setDeleting] = useState(false)
+  const [deleteRuns, setDeleteRuns] = useState(null)   // run count for the warning
+
+  const askDelete = (sch) => {
+    if (deleting) return
+    setDeleteRuns(null)
+    setConfirmDelete(sch)
+    fetchScheduleRuns(sch.id)
+      .then(r => setDeleteRuns(Array.isArray(r) ? r.length : 0))
+      .catch(() => setDeleteRuns(null))
+  }
+
+  const handleDelete = async () => {
+    const sch = confirmDelete
+    if (!sch || deleting) return
+    setDeleting(true)
     try {
-      await deleteSchedule(id)
-      if (histItem?.id === id) setHistItem(null)
+      await deleteSchedule(sch.id)
+      if (histItem?.id === sch.id) setHistItem(null)
+      setConfirmDelete(null)
       await loadSchedules()
       showToast('Schedule deleted')
     } catch (e) {
-      showToast(`⚠ Delete failed: ${e.message}`)
+      showToast(`Delete failed: ${e.message}`, 'error')
+    } finally {
+      setDeleting(false)
     }
   }
 
@@ -853,8 +878,9 @@ SMTP_FROM_EMAIL=your_gmail_address@gmail.com`}</pre>
                       {/* Delete */}
                       <button
                         className="btn btn-danger btn-sm"
-                        onClick={() => handleDelete(s.id)}
-                        title="Delete"
+                        onClick={() => askDelete(s)}
+                        disabled={deleting}
+                        title="Delete this schedule and its report history"
                       >
                         ✕
                       </button>
@@ -906,6 +932,37 @@ SMTP_FROM_EMAIL=your_gmail_address@gmail.com`}</pre>
           </table>
         </div>
       )}
+
+      {/* Delete confirmation. Deleting a schedule also deletes its run history, so
+          the dialog says so plainly and names how many runs will be lost. */}
+      <ConfirmDialog
+        open={!!confirmDelete}
+        title="Delete Schedule?"
+        confirmLabel="Delete Schedule"
+        busyLabel="Deleting…"
+        busy={deleting}
+        onCancel={() => { if (!deleting) { setConfirmDelete(null); setDeleteRuns(null) } }}
+        onConfirm={handleDelete}
+      >
+        <p>
+          Delete the schedule{' '}
+          <span className="text-ge-text1 font-medium break-words">
+            {typeLabel(confirmDelete?.eq_type)}
+            {confirmDelete?.eq_id ? ` / ${confirmDelete.eq_id}` : ''}
+          </span>?
+        </p>
+        <p className="mt-2 text-ge-danger">
+          {deleteRuns === null
+            ? 'Its report history will be deleted with it.'
+            : deleteRuns === 0
+              ? 'It has no recorded runs.'
+              : `Its ${deleteRuns} recorded run${deleteRuns === 1 ? '' : 's'} will be deleted with it.`}
+        </p>
+        <p className="mt-2 text-ge-text3">
+          This cannot be undone. Generated Excel/PDF files already downloaded or
+          emailed are not affected.
+        </p>
+      </ConfirmDialog>
 
       {/* Generate & Send confirmation for ONE saved schedule - the app's shared
           dialog, the same component used elsewhere. */}

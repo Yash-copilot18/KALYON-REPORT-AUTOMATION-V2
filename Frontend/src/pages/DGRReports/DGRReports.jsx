@@ -1595,16 +1595,19 @@ export default function DGRReports() {
       <PageHeader
         title="Generation Reports"
       >
-        {/* DGR exports PDF only (client requirement); MGR/YGR keep CSV + Excel. */}
+        {/* Export formats per report (client requirement):
+              · DGR      → PDF only
+              · MGR/YGR  → Excel only (no CSV, no PDF)
+            The CSV and PDF builders are untouched and still handle all three, so this
+            is purely which buttons the page offers. */}
         {type !== 'DGR' && (
-          <button className="btn btn-outline btn-sm" onClick={onCsvExport} disabled={loading || pdfBusy}>📊 CSV</button>
+          <button className="btn btn-outline btn-sm" onClick={onExcelExport} disabled={loading}>📗 Excel</button>
         )}
-        {type !== 'DGR' && (
-          <button className="btn btn-outline btn-sm" onClick={onExcelExport} disabled={loading || pdfBusy}>📗 Excel</button>
+        {type === 'DGR' && (
+          <button className="btn btn-primary btn-sm" onClick={exportPdf} disabled={loading || pdfBusy}>
+            {pdfBusy ? <><Spinner size={12} /> PDF…</> : '📄 PDF'}
+          </button>
         )}
-        <button className="btn btn-primary btn-sm" onClick={exportPdf} disabled={loading || pdfBusy}>
-          {pdfBusy ? <><Spinner size={12} /> PDF…</> : '📄 PDF'}
-        </button>
       </PageHeader>
 
       {/* Report selector */}

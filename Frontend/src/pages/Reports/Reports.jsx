@@ -95,12 +95,15 @@ function renderCell(col, val) {
   return <span className="font-mono text-ge-text2 text-[11px]">{String(val)}</span>
 }
 
-// Per-column width (px), sized so the HEADER is fully readable in AT MOST two wrapped
-// lines (never truncated with "…"), and data like "31/12/2024 23:59:59" never clips.
-// ~6.3px per char at the 10px header font: half the label fits on each of two lines,
-// and the longest single word is guaranteed to fit one line. Clamped so the table
-// stays horizontally scrollable rather than gigantic. Header + data share this width
-// (via <colgroup>), so columns stay perfectly aligned.
+// Per-column width (px). The header shows the COMPLETE label and wraps over as many
+// lines as it needs, so this only decides how WIDE a column is, never how much of the
+// label survives — nothing is ever truncated or replaced with "…".
+//
+// It aims for roughly two wrapped lines (~6.3px per char at the 10px header font) and
+// guarantees the longest single word fits one line; a label that needs three or four
+// lines simply gets a taller header row. The clamp keeps the table horizontally
+// scrollable rather than letting one long tag stretch it off-screen. Header and data
+// share this width via <colgroup>, so the columns stay aligned.
 const colWidth = (c) => {
   if (c.isTs) return 200
   if (c.key === '_equipment') return 150
@@ -228,10 +231,15 @@ function VirtualDataTable({ cols = [], rows = [] }) {
               <th key={c.key} className="text-[10px] sticky top-0 z-10"
                   style={{ textAlign: 'center', verticalAlign: 'middle',
                            whiteSpace: 'normal', padding: '5px 6px' }}>
-                <div style={{ display: '-webkit-box', WebkitLineClamp: 2,
-                              WebkitBoxOrient: 'vertical', overflow: 'hidden',
-                              whiteSpace: 'normal', wordBreak: 'break-word',
-                              lineHeight: 1.2, textAlign: 'center' }}>
+                {/* The COMPLETE database label, however long. It wraps over as many
+                    lines as it needs and the header row grows to fit; the column is
+                    never widened past its share, because the table scrolls
+                    horizontally instead. `anywhere` lets a single unbroken token
+                    (SOME_VERY_LONG_TAG_NAME) break rather than overflow. */}
+                <div title={c.label}
+                     style={{ whiteSpace: 'normal', overflowWrap: 'anywhere',
+                              wordBreak: 'break-word', lineHeight: 1.2,
+                              textAlign: 'center' }}>
                   {c.label}
                 </div>
               </th>

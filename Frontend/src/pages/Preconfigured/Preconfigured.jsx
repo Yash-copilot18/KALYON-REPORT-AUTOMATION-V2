@@ -1227,8 +1227,17 @@ export default function Preconfigured() {
               <table className="data-table">
                 <thead>
                   <tr>
+                    {/* The COMPLETE database label. It wraps over as many lines as it
+                        needs and the header row grows to fit, rather than being cut
+                        off; the min/max width keeps columns readable without one long
+                        tag stretching the table, which scrolls horizontally instead. */}
                     {tableCols.map(c => (
-                      <th key={c.key} className="text-[10px] sticky top-0 z-10 whitespace-nowrap">
+                      <th key={c.key} className="text-[10px] sticky top-0 z-10"
+                          title={c.label}
+                          style={{ whiteSpace: 'normal', overflowWrap: 'anywhere',
+                                   wordBreak: 'break-word', lineHeight: 1.2,
+                                   minWidth: c.isTs ? 170 : 110, maxWidth: 220,
+                                   verticalAlign: 'middle', textAlign: 'center' }}>
                         {c.label}
                       </th>
                     ))}
