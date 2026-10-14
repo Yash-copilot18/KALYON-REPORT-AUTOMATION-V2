@@ -531,6 +531,20 @@ export const updateSavedReport = (id, payload) =>
 export const deleteSavedReport = (id) =>
   api.delete(`/api/v1/saved-reports/${id}`)
 
+// ── AI assurance report ────────────────────────────────────────────────────
+// Deterministic forensic analysis. `preflight` reports what the archive can
+// actually support before anything runs; `start` queues a background job because a
+// forensic pass reads 1-minute telemetry across the whole fleet. `timeout: 0` on the
+// poll is deliberate — the polls are tiny, but the job they watch runs for minutes.
+export const fetchAIPreflight = () =>
+  api.get('/api/v1/ai-report/preflight', { timeout: 0 })
+
+export const startAIReport = (payload) =>
+  api.post('/api/v1/ai-report/start', payload, { timeout: 0 })
+
+export const fetchAIReportStatus = (jobId) =>
+  api.get(`/api/v1/ai-report/status/${jobId}`, { timeout: 0 })
+
 // ── Users ──────────────────────────────────────────────────────────────────
 export const fetchUsers = () =>
   Promise.resolve([

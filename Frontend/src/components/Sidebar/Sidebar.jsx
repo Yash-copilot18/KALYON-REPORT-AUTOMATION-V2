@@ -4,8 +4,7 @@ import { NavLink } from 'react-router-dom'
 import {
   MdDashboard, MdBarChart, MdAssignment, MdAnalytics,
   MdBuild, MdNotifications, MdSchedule, MdPeople, MdSettings,
-  MdChevronLeft, MdChevronRight, MdSatelliteAlt, MdShowChart, MdBolt, MdTune,
-} from 'react-icons/md'
+  MdChevronLeft, MdChevronRight, MdSatelliteAlt, MdShowChart, MdBolt, MdTune, MdInsights } from 'react-icons/md'
 import { useApp } from '../../utils/AppContext'
 
 // `hidden: true` removes an item from the sidebar without deleting its route or
@@ -18,6 +17,7 @@ const NAV_ITEMS = [
   { label: 'DGR Reports',       path: '/dgr',       icon: MdAssignment,    group: 'Operations'  },
   { label: 'Analytics',         path: '/analytics', icon: MdAnalytics,     group: 'Operations'  },
   { label: 'Preconfigured Reports', path: '/preconfigured', icon: MdTune,   group: 'Operations'  },
+  { label: 'AI Report',         path: '/ai-report', icon: MdInsights,     group: 'Operations'  },
   { label: 'PPC Trend',         path: '/ppc-trend', icon: MdShowChart,     group: 'Operations', hidden: true },
   { label: 'Power Graph',       path: '/power-graph', icon: MdBolt,        group: 'Operations', hidden: true },
   { label: 'Equipment',         path: '/equipment', icon: MdBuild,         group: 'Monitoring', hidden: true },

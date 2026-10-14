@@ -195,6 +195,7 @@ from app.routers import (
     tracker,
     isolator,
     saved_reports,
+    ai_report,
 )
 
 app.include_router(health.router)
@@ -208,6 +209,7 @@ app.include_router(scheduled.router,      prefix="/api/v1")
 app.include_router(tracker.router,        prefix="/api/v1")
 app.include_router(isolator.router,       prefix="/api/v1")
 app.include_router(saved_reports.router,  prefix="/api/v1")
+app.include_router(ai_report.router,      prefix="/api/v1")
 
 
 # ── Root ──────────────────────────────────────────────────────────────────────
