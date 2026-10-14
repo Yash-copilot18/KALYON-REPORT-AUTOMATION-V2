@@ -3,7 +3,7 @@
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 from datetime import datetime
-from typing import Optional, List, Dict, Any
+from typing import List, Dict, Any
 from fastapi import HTTPException, status
 import logging
 

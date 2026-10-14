@@ -359,7 +359,7 @@ def _smb_bytes(req, equipment_ids, progress=None):
     data are byte-for-byte what they were; only the worksheet organisation changed.
     Returns (bytes, filename, content_type).
     """
-    from app.services import report_excel
+    from app.services import report_excel  # noqa: F401 — installs faster .xlsx zip packaging
 
     tables = [t for t in equipment_ids if _safe_name(t)]
     interval = req.interval.value if hasattr(req.interval, "value") else str(req.interval)

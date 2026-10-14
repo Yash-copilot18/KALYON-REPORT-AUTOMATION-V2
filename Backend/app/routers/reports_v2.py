@@ -14,9 +14,7 @@ import logging
 import threading
 from datetime import datetime
 
-from openpyxl import Workbook
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
-from openpyxl.utils import get_column_letter
 
 from app.database.session import get_db
 from app.schemas.reports_schema import ReportDataRequest, MultiReportRequest

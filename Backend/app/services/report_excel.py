@@ -59,7 +59,7 @@ _XLSX_COMPRESSLEVEL = 2
 
 def _install_fast_zip(level: int = _XLSX_COMPRESSLEVEL) -> None:
     import xlsxwriter.workbook as _wbmod
-    from zipfile import ZipFile as _ZipFile, ZipInfo as _ZipInfo
+    from zipfile import ZipInfo as _ZipInfo
     if getattr(_wbmod.ZipFile, "_kalyon_fast", False):
         return                                   # already installed in this process
     _Base = _wbmod.ZipFile

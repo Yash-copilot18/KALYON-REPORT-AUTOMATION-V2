@@ -78,11 +78,9 @@ def get_dashboard_kpis(db: Session = Depends(get_db)):
         frequency     = float(ppc[6])  if ppc and ppc[6]  else 0
         voltage       = float(ppc[7])  if ppc and ppc[7]  else 0
         pf            = float(ppc[8])  if ppc and ppc[8]  else 0
-        grid_power    = float(ppc[9])  if ppc and ppc[9]  else 0
         daily_op_time = int(ppc[10])   if ppc and ppc[10] else 0
 
         ghi         = float(wms[0]) if wms and wms[0] else 0
-        gti         = float(wms[1]) if wms and wms[1] else 0
         module_temp = float(wms[2]) if wms and wms[2] else 0
         wind_speed  = float(wms[3]) if wms and wms[3] else 0
         air_temp    = float(wms[4]) if wms and wms[4] else 0

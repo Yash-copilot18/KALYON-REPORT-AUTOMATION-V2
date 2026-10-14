@@ -1,7 +1,7 @@
 # app/schemas/reports_schema.py
 
 from pydantic import BaseModel, Field, field_validator
-from typing import Optional, List, Any, Dict
+from typing import Optional, List
 from datetime import datetime
 from enum import Enum
 

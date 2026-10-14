@@ -16,10 +16,10 @@ import logging
 import threading
 from datetime import datetime
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.orm import Session
-from typing import List, Optional
+from typing import List
 
 from app.database.session import get_db
 from app.services import tracker_service, export_jobs

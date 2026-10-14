@@ -40,7 +40,6 @@ import re
 import time
 import zipfile
 import logging
-import threading
 from datetime import datetime
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from typing import List, Tuple, Optional, Callable, Iterator

@@ -130,7 +130,7 @@ def send_test_email(req: TestEmailRequest):
         filename, mm, ms = f"{base}.pdf", PDF_MIME[0], PDF_MIME[1]
     else:
         data = build_excel_bytes(columns, rows, sheet_title=req.equipment_id,
-                                 title=f"Kalyon Solar Monitoring — Sample")
+                                 title="Kalyon Solar Monitoring — Sample")
         filename, mm, ms = f"{base}.xlsx", XLSX_MIME[0], XLSX_MIME[1]
 
     result = email_service.send_email_with_attachment(

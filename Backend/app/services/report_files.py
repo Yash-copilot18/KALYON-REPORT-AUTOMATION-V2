@@ -110,8 +110,6 @@ def build_excel_bytes(columns, rows, sheet_title: str = "Report", title: str | N
     ws.title = (sheet_title or "Report")[:30]
     ws.sheet_view.showGridLines = False
 
-    n = max(len(columns), 1)
-
     # Clean white/black corporate theme (printer-friendly) — matches report_excel.
     BLACK    = "000000"    # every title, header and data value
     GRAY_HDR = "F2F2F2"    # table header fill

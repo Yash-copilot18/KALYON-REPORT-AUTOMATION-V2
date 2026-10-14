@@ -1,8 +1,7 @@
 # app/models/equipment.py
 
-from sqlalchemy import Column, Integer, String, DateTime, Enum as SAEnum
+from sqlalchemy import Column, Integer, String, DateTime
 from sqlalchemy.sql import func
-from datetime import datetime, timezone
 import enum
 
 from app.database.base import Base

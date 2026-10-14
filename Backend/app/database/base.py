@@ -1,12 +1,6 @@
 # app/database/base.py
 
 from sqlalchemy.orm import DeclarativeBase, declared_attr
-from sqlalchemy import Column, DateTime
-from datetime import datetime, timezone
-
-def import_all_models():
-    from app.models import equipment  # noqa
-    from app.models import reports    # noqa  ← add this line
 
 class Base(DeclarativeBase):
     """
@@ -32,6 +26,7 @@ class Base(DeclarativeBase):
 # Add new model imports below as you create them.
 def import_all_models():
     from app.models import equipment      # noqa: F401
+    from app.models import reports        # noqa: F401
     from app.models import schedules      # noqa: F401
     from app.models import saved_reports  # noqa: F401
     from app.models import app_settings   # noqa: F401
