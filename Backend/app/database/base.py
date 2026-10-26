@@ -30,3 +30,4 @@ def import_all_models():
     from app.models import schedules      # noqa: F401
     from app.models import saved_reports  # noqa: F401
     from app.models import app_settings   # noqa: F401
+    from app.models import forecasts      # noqa: F401

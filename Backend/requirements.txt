@@ -10,3 +10,7 @@ openpyxl
 XlsxWriter
 reportlab
 APScheduler
+
+# Forecasting (app/forecast) - day-ahead generation model
+numpy
+scikit-learn
