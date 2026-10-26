@@ -531,19 +531,32 @@ export const updateSavedReport = (id, payload) =>
 export const deleteSavedReport = (id) =>
   api.delete(`/api/v1/saved-reports/${id}`)
 
-// ── AI assurance report ────────────────────────────────────────────────────
-// Deterministic forensic analysis. `preflight` reports what the archive can
-// actually support before anything runs; `start` queues a background job because a
-// forensic pass reads 1-minute telemetry across the whole fleet. `timeout: 0` on the
-// poll is deliberate — the polls are tiny, but the job they watch runs for minutes.
-export const fetchAIPreflight = () =>
-  api.get('/api/v1/ai-report/preflight', { timeout: 0 })
+// ── Generation forecasting & deviation detection ───────────────────────────
+// `status` is cheap and safe to call on page load; `run` trains and predicts,
+// so it takes seconds and gets no timeout. Everything else reads what the last
+// run stored.
+export const fetchForecastStatus = () =>
+  api.get('/api/v1/forecast/status', { timeout: 0 })
 
-export const startAIReport = (payload) =>
-  api.post('/api/v1/ai-report/start', payload, { timeout: 0 })
+export const runForecast = (payload = {}) =>
+  api.post('/api/v1/forecast/run', payload, { timeout: 0 })
 
-export const fetchAIReportStatus = (jobId) =>
-  api.get(`/api/v1/ai-report/status/${jobId}`, { timeout: 0 })
+export const fetchForecastLatest = () =>
+  api.get('/api/v1/forecast/latest', { timeout: 0 })
+
+export const fetchForecastNextDay = () =>
+  api.get('/api/v1/forecast/next-day', { timeout: 0 })
+
+export const fetchForecastHistory = (limit = 120) =>
+  api.get('/api/v1/forecast/history', { params: { limit }, timeout: 0 })
+
+export const fetchForecastDeviations = (onlyAlerts = true, limit = 50) =>
+  api.get('/api/v1/forecast/deviations', {
+    params: { only_alerts: onlyAlerts, limit }, timeout: 0 })
+
+export const reconcileForecast = (lookbackDays = 60) =>
+  api.post('/api/v1/forecast/reconcile', null, {
+    params: { lookback_days: lookbackDays }, timeout: 0 })
 
 // ── Users ──────────────────────────────────────────────────────────────────
 export const fetchUsers = () =>

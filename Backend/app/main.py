@@ -195,7 +195,6 @@ from app.routers import (
     tracker,
     isolator,
     saved_reports,
-    ai_report,
 )
 
 app.include_router(health.router)
@@ -209,7 +208,20 @@ app.include_router(scheduled.router,      prefix="/api/v1")
 app.include_router(tracker.router,        prefix="/api/v1")
 app.include_router(isolator.router,       prefix="/api/v1")
 app.include_router(saved_reports.router,  prefix="/api/v1")
-app.include_router(ai_report.router,      prefix="/api/v1")
+
+# Forecasting needs the numeric stack (numpy, scikit-learn). Those are declared
+# in requirements.txt, but an environment that has not been updated must still
+# serve the dashboard: a missing OPTIONAL dependency may disable one feature,
+# never the whole API. The failure is logged loudly with the fix, rather than
+# being swallowed.
+try:
+    from app.routers import forecast
+    app.include_router(forecast.router, prefix="/api/v1")
+except ImportError as exc:                       # noqa: BLE001 - startup must survive
+    logger.warning(
+        "Forecasting is DISABLED - %s. Every other endpoint is unaffected. "
+        "To enable it, install the dependencies into the interpreter you run "
+        "the server with:  pip install -r requirements.txt", exc)
 
 
 # ── Root ──────────────────────────────────────────────────────────────────────

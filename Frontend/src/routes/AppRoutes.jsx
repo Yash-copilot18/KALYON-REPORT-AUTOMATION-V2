@@ -18,7 +18,7 @@ const TrackerStatus = lazy(() => import('../pages/TrackerStatus/TrackerStatus'))
 const DGRReports    = lazy(() => import('../pages/DGRReports/DGRReports'))
 const Analytics     = lazy(() => import('../pages/Analytics/Analytics'))
 const Preconfigured = lazy(() => import('../pages/Preconfigured/Preconfigured'))
-const AIReport      = lazy(() => import('../pages/AIReport/AIReport'))
+const Forecast      = lazy(() => import('../pages/Forecast/Forecast'))
 const PPCTrend      = lazy(() => import('../pages/PPCTrend/PPCTrend'))
 const PowerGraph    = lazy(() => import('../pages/PowerGraph/PowerGraph'))
 const Equipment     = lazy(() => import('../pages/Equipment/Equipment'))
@@ -48,7 +48,7 @@ export default function AppRoutes() {
         <Route path="/dgr"        element={<DGRReports />} />
         <Route path="/analytics"  element={<Analytics />} />
         <Route path="/preconfigured" element={<Preconfigured />} />
-        <Route path="/ai-report"  element={<AIReport />} />
+        <Route path="/forecast"   element={<Forecast />} />
         <Route path="/ppc-trend"  element={<PPCTrend />} />
         <Route path="/power-graph" element={<PowerGraph />} />
         <Route path="/equipment"  element={<Equipment />} />
