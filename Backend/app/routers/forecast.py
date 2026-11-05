@@ -30,6 +30,7 @@ from app.forecast import features as F
 from app.forecast import cache as C
 from app.forecast import service as S
 from app.forecast import weather as W
+from app.forecast import aggregate as AGG
 from app.models.forecasts import ForecastPoint, ForecastRun
 
 logger = logging.getLogger(__name__)
@@ -134,11 +135,20 @@ def forecast_next_day(db: Session = Depends(get_db)) -> Dict[str, Any]:
 
 @router.get("/history")
 def forecast_history(limit: int = Query(120, ge=1, le=1000),
+                     bucket: str = Query("day", pattern="^(day|week|month)$"),
                      db: Session = Depends(get_db)) -> Dict[str, Any]:
-    """Actual vs predicted, newest last — the series behind the chart."""
+    """
+    Actual vs predicted, newest last — the series behind the chart.
+
+    `bucket` rolls that same daily series into calendar weeks or months. It is
+    the daily series that is aggregated, not a second model: a week is the sum
+    of its days. `day` returns exactly what it always has, so nothing that
+    already calls this endpoint sees a change.
+    """
     run = db.query(ForecastRun).order_by(ForecastRun.id.desc()).first()
     if not run:
         return {"points": [], "n_points": 0, "n_reconciled": 0,
+                "bucket": bucket,
                 "note": "No forecast has been run yet."}
     pts = (db.query(ForecastPoint)
              .filter(ForecastPoint.run_id == run.id)
@@ -156,14 +166,28 @@ def forecast_history(limit: int = Query(120, ge=1, le=1000),
         "is_backtest": bool(p.is_backtest),
     } for p in reversed(pts)]
     scored = [r for r in rows if r["actual_mwh"] is not None]
-    return {
-        "points": rows,
-        "n_points": len(rows),
+    base = {
         "n_reconciled": len(scored),
         "run_id": run.id,
         "note": ("Points marked is_backtest were predicted by a model that had not "
                  "seen that day - the held-out test block. Points without an actual "
                  "are days that have not completed yet."),
+    }
+    if bucket == "day":
+        return {"points": rows, "n_points": len(rows), "bucket": "day", **base}
+
+    periods = AGG.aggregate_points(rows, bucket)
+    partial = [p for p in periods
+               if not p["actual_complete"] and p["days_with_actual"]]
+    return {
+        "points": periods,
+        "n_points": len(periods),
+        "bucket": bucket,
+        "n_daily_points": len(rows),
+        "n_partial_actual_periods": len(partial),
+        **base,
+        "note": " ".join([base["note"], AGG.AGGREGATION_NOTE[bucket],
+                          AGG.INTERVAL_CAVEAT]),
     }
 
 

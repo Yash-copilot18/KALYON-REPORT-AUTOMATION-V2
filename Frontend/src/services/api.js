@@ -547,8 +547,31 @@ export const fetchForecastLatest = () =>
 export const fetchForecastNextDay = () =>
   api.get('/api/v1/forecast/next-day', { timeout: 0 })
 
-export const fetchForecastHistory = (limit = 120) =>
-  api.get('/api/v1/forecast/history', { params: { limit }, timeout: 0 })
+// `bucket` is 'day' | 'week' | 'month'. 'day' is the original series and the
+// original payload; the other two are that same series summed into calendar
+// periods server-side, so a week can never disagree with the days inside it.
+export const fetchForecastHistory = (limit = 120, bucket = 'day') =>
+  api.get('/api/v1/forecast/history', { params: { limit, bucket }, timeout: 0 })
+
+// ── device-wise forecasting ──────────────────────────────────────────────────
+// Inverters are forecast individually; combiner boxes are ranked against their
+// peers. A device run takes minutes, so it is button-driven and its results
+// are polled from the cache rather than recomputed per request.
+export const fetchDeviceInventory = () =>
+  api.get('/api/v1/devices/inventory', { timeout: 0 })
+
+export const runDeviceForecasts = () =>
+  api.post('/api/v1/devices/forecast', null, { timeout: 0 })
+
+export const fetchDeviceForecasts = () =>
+  api.get('/api/v1/devices/forecast', { timeout: 0 })
+
+export const fetchDeviceHistory = (deviceId, bucket = 'day') =>
+  api.get(`/api/v1/devices/${encodeURIComponent(deviceId)}/history`,
+          { params: { bucket }, timeout: 0 })
+
+export const fetchCombinerAnalysis = () =>
+  api.get('/api/v1/devices/combiners', { timeout: 0 })
 
 export const fetchForecastDeviations = (onlyAlerts = true, limit = 50) =>
   api.get('/api/v1/forecast/deviations', {
