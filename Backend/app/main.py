@@ -1,6 +1,7 @@
 # app/main.py
 
 import logging
+import threading
 import sys
 import os
 from contextlib import asynccontextmanager
@@ -80,8 +81,27 @@ async def lifespan(app: FastAPI):
     except Exception as e:  # noqa: BLE001 — never block startup on the scheduler
         logger.error("Failed to start scheduler: %s", e, exc_info=True)
 
+    # Spawn the forecast workers now, in the background, rather than on the
+    # first click. On Windows each worker starts a fresh interpreter and
+    # re-imports scikit-learn, which costs about 7.5 seconds for eleven of
+    # them - a cost worth paying while nobody is waiting. Startup does not
+    # block on it, and a failure here only means the first run falls back to
+    # doing its fitting in this process.
+    try:
+        from app.forecast import pool as forecast_pool
+        threading.Thread(target=forecast_pool.warm,
+                         name="forecast-pool-warm", daemon=True).start()
+    except Exception as e:  # noqa: BLE001 - the pool is an optimisation, not a dependency
+        logger.warning("Could not start forecast pool warm-up: %s", e)
+
     logger.info("Application startup complete. Ready to accept requests.")
     yield
+
+    try:
+        from app.forecast import pool as forecast_pool
+        forecast_pool.shutdown()
+    except Exception:  # noqa: BLE001
+        pass
 
     from app.services import scheduler as _sched
     _sched.stop_scheduler()
@@ -217,6 +237,11 @@ app.include_router(saved_reports.router,  prefix="/api/v1")
 try:
     from app.routers import forecast
     app.include_router(forecast.router, prefix="/api/v1")
+    # Device-wise forecasting shares the same numeric stack, so it lives behind
+    # the same guard. Registered after the plant router and entirely separate
+    # from it: nothing here can change how the plant forecast behaves.
+    from app.routers import devices as devices_router
+    app.include_router(devices_router.router, prefix="/api/v1")
 except ImportError as exc:                       # noqa: BLE001 - startup must survive
     logger.warning(
         "Forecasting is DISABLED - %s. Every other endpoint is unaffected. "
