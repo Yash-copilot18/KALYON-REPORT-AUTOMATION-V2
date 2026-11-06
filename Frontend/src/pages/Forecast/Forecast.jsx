@@ -13,6 +13,7 @@ import {
   ResponsiveContainer, Legend, ReferenceLine,
 } from 'recharts'
 import { KpiCard, PageHeader, DataTable, Skeleton, Spinner } from '../../components/Common'
+import DeviceSection from '../../components/Devices/DeviceSection'
 import {
   fetchForecastStatus, runForecast, fetchForecastLatest, fetchForecastNextDay,
   fetchForecastHistory, fetchForecastDeviations, reconcileForecast,
@@ -33,6 +34,137 @@ const STATUS_STYLE = {
   UNRELIABLE: 'bg-slate-700/50 text-slate-300',
 }
 
+/** Chart aggregation periods. Energy is summed per period, never averaged. */
+const BUCKETS = [
+  { id: 'day',   label: 'Day',   unit: 'MWh / day',   title: 'daily' },
+  { id: 'week',  label: 'Week',  unit: 'MWh / week',  title: 'weekly (Mon–Sun)' },
+  { id: 'month', label: 'Month', unit: 'MWh / month', title: 'monthly' },
+]
+
+/** Day | Week | Month. The same series, grouped differently. */
+export function BucketTabs({ value, onChange }) {
+  return (
+    <div className="flex rounded border border-ge-border overflow-hidden">
+      {BUCKETS.map(b => (
+        <button
+          key={b.id}
+          onClick={() => onChange(b.id)}
+          aria-pressed={value === b.id}
+          className={`px-2.5 py-1 text-[11px] transition-colors ${
+            value === b.id ? 'bg-ge-blue/20 text-ge-text1'
+                           : 'text-ge-text3 hover:text-ge-text2'}`}
+        >
+          {b.label}
+        </button>
+      ))}
+    </div>
+  )
+}
+
+/**
+ * Tooltip for the aggregated chart.
+ *
+ * A bar can be three measured days sitting beside a prediction for all seven,
+ * and the shape on screen cannot show that. The coverage counts are therefore
+ * spelled out on hover, and a period that is not whole says so instead of
+ * offering a comparison that would be read as a shortfall.
+ */
+export function PeriodTooltip({ active, payload, label, bucket }) {
+  if (!active || !payload?.length) return null
+  const m = payload[0]?.payload?.meta
+  const rows = [
+    ['Actual', payload.find(p => p.dataKey === 'actual')?.value, m?.days_with_actual],
+    ['Predicted', payload.find(p => p.dataKey === 'predicted')?.value, m?.days_with_predicted],
+  ]
+  return (
+    <div className="bg-[#121a26] border border-[#243043] px-2.5 py-2 text-[11px]">
+      <div className="text-ge-text1 font-medium mb-1">{label}</div>
+      {rows.map(([name, value, days]) => (
+        <div key={name} className="flex gap-2 justify-between">
+          <span className="text-ge-text3">{name}</span>
+          <span>
+            {value == null ? '—' : `${fmt(value, 1)} MWh`}
+            {bucket !== 'day' && value != null && m
+              ? <span className="text-ge-text3"> ({days}/{m.days_in_period} d)</span>
+              : null}
+          </span>
+        </div>
+      ))}
+      {m?.lower_mwh != null && (
+        <div className="flex gap-2 justify-between">
+          <span className="text-ge-text3">Interval</span>
+          <span>{fmt(m.lower_mwh, 0)} – {fmt(m.upper_mwh, 0)} MWh</span>
+        </div>
+      )}
+      {bucket !== 'day' && m && !m.comparable && (
+        <div className="text-amber-400/90 mt-1 max-w-[220px]">
+          {m.days_with_actual === 0
+            ? 'Forecast only — this period has not been measured.'
+            : `Partial: ${m.days_with_actual} of ${m.days_in_period} days measured, `
+              + `so this total is not compared with the prediction.`}
+        </div>
+      )}
+    </div>
+  )
+}
+
+/**
+ * The Actual vs Predicted chart, shared by the plant and by one device.
+ *
+ * One component with a configurable period rather than three charts: the
+ * colours, the band and the axis conventions then cannot drift apart between
+ * the plant view and a device view.
+ */
+export function GenerationChart({ points, bucket }) {
+  const B = BUCKETS.find(b => b.id === bucket) || BUCKETS[0]
+  const data = (points || []).map(p => ({
+    // Week and month carry their own label ("02 Jun - 08 Jun", "Jun 2025");
+    // the day series has none, so it keeps the format it always had.
+    date: p.label || shortDate(p.date),
+    actual: p.actual_mwh,
+    predicted: p.predicted_mwh,
+    // Recharts stacks an Area from a base, so the band is [lower, upper].
+    band: p.lower_mwh != null && p.upper_mwh != null
+      ? [p.lower_mwh, p.upper_mwh] : null,
+    meta: p,
+  }))
+  return (
+    <ResponsiveContainer width="100%" height="100%">
+      <ComposedChart data={data} margin={{ top: 8, right: 16, bottom: 4, left: 0 }}>
+        <CartesianGrid strokeDasharray="3 3" stroke="#243043" />
+        <XAxis dataKey="date" tick={{ fontSize: 10, fill: '#7d8da3' }} />
+        <YAxis tick={{ fontSize: 10, fill: '#7d8da3' }}
+               label={{ value: B.unit, angle: -90, position: 'insideLeft',
+                        fill: '#7d8da3', fontSize: 10 }} />
+        <Tooltip content={<PeriodTooltip bucket={bucket} />} />
+        <Legend wrapperStyle={{ fontSize: 11 }} />
+        <Area dataKey="band" name="Prediction interval" stroke="none"
+              fill="#0b63a8" fillOpacity={0.18} connectNulls={false} />
+        <Line dataKey="actual" name="Actual" stroke="#22c55e" strokeWidth={2}
+              dot={false} connectNulls={false} />
+        <Line dataKey="predicted" name="Predicted" stroke="#f59e0b"
+              strokeWidth={2} strokeDasharray="4 3" dot={false} />
+      </ComposedChart>
+    </ResponsiveContainer>
+  )
+}
+
+/** Periods that are only partly measured, named so nobody has to infer it. */
+export function PartialNote({ points, bucket }) {
+  if (bucket === 'day') return null
+  const partial = (points || []).filter(
+    p => p.days_with_actual > 0 && !p.actual_complete)
+  if (!partial.length) return null
+  return (
+    <div className="text-[11px] text-amber-400/90 mt-1.5">
+      Partly measured, so not compared with their predictions:{' '}
+      {partial.map(p =>
+        `${p.label} (${p.days_with_actual} of ${p.days_in_period} days)`).join(', ')}.
+      A period is only scored when both sides cover all of it.
+    </div>
+  )
+}
+
 export default function Forecast() {
   const [status, setStatus]       = useState(null)
   const [latest, setLatest]       = useState(null)
@@ -42,21 +174,22 @@ export default function Forecast() {
   const [loading, setLoading]     = useState(true)
   const [running, setRunning]     = useState(false)
   const [error, setError]         = useState('')
+  // 'day' is the original view and stays the default: switching only changes
+  // how the same daily series is grouped, never which numbers it holds.
+  const [bucket, setBucket]       = useState('day')
 
   const loadAll = useCallback(async () => {
     setError('')
     try {
       // The shared axios client unwraps the body in its response interceptor
       // (`res => res.data`), so these are payloads already — never `.data`.
-      const [s, l, n, h, d] = await Promise.all([
+      const [s, l, n, d] = await Promise.all([
         fetchForecastStatus(),
         fetchForecastLatest(),
         fetchForecastNextDay(),
-        fetchForecastHistory(180),
         fetchForecastDeviations(false, 60),
       ])
-      setStatus(s); setLatest(l); setNextDay(n)
-      setHistory(h); setDeviations(d)
+      setStatus(s); setLatest(l); setNextDay(n); setDeviations(d)
     } catch (e) {
       setError(e?.response?.data?.detail || e.message || 'Could not load forecast data.')
     } finally {
@@ -64,7 +197,18 @@ export default function Forecast() {
     }
   }, [])
 
+  // The chart series is fetched on its own so that changing Day/Week/Month
+  // re-reads one endpoint rather than reloading the whole page.
+  const loadHistory = useCallback(async (b) => {
+    try {
+      setHistory(await fetchForecastHistory(180, b))
+    } catch (e) {
+      setError(e?.response?.data?.detail || e.message || 'Could not load the chart series.')
+    }
+  }, [])
+
   useEffect(() => { loadAll() }, [loadAll])
+  useEffect(() => { loadHistory(bucket) }, [bucket, loadHistory])
 
   // Train, then reconcile any completed days, then refresh everything.
   const onRun = async () => {
@@ -73,7 +217,7 @@ export default function Forecast() {
     try {
       await runForecast({ target: 'energy_net_mwh' })
       await reconcileForecast(400)
-      await loadAll()
+      await Promise.all([loadAll(), loadHistory(bucket)])
     } catch (e) {
       setError(e?.response?.data?.detail || e.message || 'Forecast run failed.')
     } finally {
@@ -95,14 +239,8 @@ export default function Forecast() {
   const run   = latest?.available ? latest : null
   const rel   = nextDay?.reliability || run?.reliability
   const met   = !!run?.target_met
-  const chart = (history?.points || []).map(p => ({
-    date: shortDate(p.date),
-    actual: p.actual_mwh,
-    predicted: p.predicted_mwh,
-    // Recharts stacks an Area from a base, so the band is [lower, upper].
-    band: p.lower_mwh != null && p.upper_mwh != null
-      ? [p.lower_mwh, p.upper_mwh] : null,
-  }))
+  const points = history?.points || []
+  const BUCKET = BUCKETS.find(b => b.id === bucket) || BUCKETS[0]
 
   return (
     <div className="space-y-3">
@@ -177,34 +315,25 @@ export default function Forecast() {
 
       {/* ── actual vs predicted ──────────────────────────────────────────── */}
       <div className="card p-3">
-        <div className="card-title mb-2">Actual vs predicted energy</div>
-        {chart.length === 0 ? (
+        <div className="flex items-center justify-between gap-3 mb-2">
+          <div className="card-title">
+            Actual vs predicted energy
+            {bucket !== 'day' && (
+              <span className="text-ge-text3 font-normal"> · {BUCKET.title}</span>
+            )}
+          </div>
+          <BucketTabs value={bucket} onChange={setBucket} />
+        </div>
+        {points.length === 0 ? (
           <div className="text-[12px] text-ge-text3 py-8 text-center">
             No forecast points yet. Use <b>Run forecast</b> to produce them.
           </div>
         ) : (
           <div className="h-72">
-            <ResponsiveContainer width="100%" height="100%">
-              <ComposedChart data={chart} margin={{ top: 8, right: 16, bottom: 4, left: 0 }}>
-                <CartesianGrid strokeDasharray="3 3" stroke="#243043" />
-                <XAxis dataKey="date" tick={{ fontSize: 10, fill: '#7d8da3' }} />
-                <YAxis tick={{ fontSize: 10, fill: '#7d8da3' }}
-                       label={{ value: 'MWh / day', angle: -90, position: 'insideLeft',
-                                fill: '#7d8da3', fontSize: 10 }} />
-                <Tooltip contentStyle={{ background: '#121a26', border: '1px solid #243043',
-                                         fontSize: 11 }} />
-                <Legend wrapperStyle={{ fontSize: 11 }} />
-                <Area dataKey="band" name="Prediction interval" stroke="none"
-                      fill="#0b63a8" fillOpacity={0.18} connectNulls={false} />
-                <Line dataKey="actual" name="Actual" stroke="#22c55e" strokeWidth={2}
-                      dot={false} connectNulls={false} />
-                <Line dataKey="predicted" name="Predicted" stroke="#f59e0b"
-                      strokeWidth={2} strokeDasharray="4 3" dot={false} />
-                <ReferenceLine y={0} stroke="#334155" />
-              </ComposedChart>
-            </ResponsiveContainer>
+            <GenerationChart points={points} bucket={bucket} />
           </div>
         )}
+        <PartialNote points={points} bucket={bucket} />
         <div className="text-[11px] text-ge-text3 mt-1">
           {history?.note}
         </div>
@@ -333,6 +462,11 @@ export default function Forecast() {
           {cov.timezone_note} {status?.data_freshness?.note}
         </div>
       </div>
+
+      {/* ── device-wise forecasting ──────────────────────────────────────── */}
+      {/* Below the plant section and independent of it: nothing in here can
+          change the plant forecast above, and it loads on its own. */}
+      <DeviceSection />
     </div>
   )
 }

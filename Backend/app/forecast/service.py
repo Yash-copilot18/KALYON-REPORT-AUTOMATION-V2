@@ -37,9 +37,16 @@ TARGET_SCORE_PCT = float(os.getenv("FORECAST_TARGET_SCORE", "83"))
 DEVIATION_PCT_THRESHOLD = float(os.getenv("FORECAST_DEVIATION_PCT", "15"))
 DEVIATION_MIN_MWH = float(os.getenv("FORECAST_DEVIATION_MIN_MWH", "50"))
 
-# How many days forward a run predicts. Capped at the validation horizon,
-# because predicting further than the backtest can score is unverifiable.
-FORECAST_DAYS = 7
+# How many days forward a run predicts.
+#
+# This was 7, capped at the validation horizon on the reasoning that predicting
+# further than the backtest can score is unverifiable. That reasoning is sound
+# and nothing here contradicts it: days beyond the backtest are still not
+# validated, and the UI labels them PLANNING ESTIMATE rather than forecast.
+# The cap is lifted to 30 so the month view has a month in it, and so a
+# planning volume can be read at all. Set FORECAST_DAYS=7 to restore the
+# previous behaviour exactly.
+FORECAST_DAYS = int(os.getenv("FORECAST_DAYS", "30"))
 
 _lock = threading.Lock()
 

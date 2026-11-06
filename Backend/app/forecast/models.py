@@ -114,8 +114,15 @@ def candidates(ghi_index: int = None) -> Dict[str, Any]:
         "Persistence (yesterday)": Baseline("Persistence (yesterday)", IDX_LAG1),
         "Seasonal Naive (lag-7)": Baseline("Seasonal Naive (lag-7)", IDX_LAG7),
         "Ridge Regression": make_pipeline(StandardScaler(), Ridge(alpha=1.0)),
+        # n_jobs=1, deliberately. Spreading 300 small trees over every core
+        # changes the order the predictions are summed, and floating-point
+        # addition is not associative, so the same data scored twice came back
+        # differing in the last few digits. With around a hundred rows the
+        # threads cost more than they save, so single-threaded is both faster
+        # here and reproducible. Devices are parallelised one level up, in
+        # device_service, where the work is big enough to be worth splitting.
         "Random Forest": RandomForestRegressor(
-            n_estimators=300, min_samples_leaf=2, random_state=0, n_jobs=-1),
+            n_estimators=300, min_samples_leaf=2, random_state=0, n_jobs=1),
         "Gradient Boosting": GradientBoostingRegressor(
             n_estimators=300, max_depth=2, learning_rate=0.05, random_state=0),
     }
