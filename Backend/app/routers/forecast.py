@@ -133,6 +133,38 @@ def forecast_next_day(db: Session = Depends(get_db)) -> Dict[str, Any]:
     }
 
 
+# Where a plotted point comes from, in the words the dashboard shows the client.
+# Described rather than queried: it is the same for every row, and a per-row copy
+# would be noise. Nothing here is configuration - no server, database or
+# credential appears, only the measurement and how it is reduced to a day.
+HISTORY_SOURCE = {
+    "table": "PPC.GRID_ACTIVE_POWER_MEASURED",
+    "measure": "net export at the grid, MW",
+    "method": ("duplicate timestamps averaged to one reading per minute, then "
+               "energy = SUM(MW) / 60 over the day"),
+    "complete_day_minutes": F.COMPLETE_DAY_MINUTES,
+    "stored_in": "forecast_points, written by the run named in run_id",
+}
+
+
+def _day_status(actual_mwh, target_date, plant_last):
+    """
+    Why a day has no actual, which is not one question but three.
+
+    A measured day is Complete. A day after the archive ends has not happened
+    yet, so it is Future. A day inside the archive with no actual is Missing -
+    the plant recorded fewer than COMPLETE_DAY_MINUTES of it, and a partial day
+    is excluded rather than integrated into an understated total that would
+    read as a plant fault.
+    """
+    if actual_mwh is not None:
+        return "Complete"
+    if plant_last is None:
+        return "Unknown"
+    d = target_date.date() if hasattr(target_date, "date") else target_date
+    return "Future" if d > plant_last else "Missing"
+
+
 @router.get("/history")
 def forecast_history(limit: int = Query(120, ge=1, le=1000),
                      bucket: str = Query("day", pattern="^(day|week|month)$"),
@@ -154,6 +186,11 @@ def forecast_history(limit: int = Query(120, ge=1, le=1000),
              .filter(ForecastPoint.run_id == run.id)
              .order_by(ForecastPoint.target_date.desc())
              .limit(limit).all())
+    # One read, outside the row loop: the last day the plant actually recorded.
+    # It is what separates "not measured" from "has not happened yet".
+    daily = F.daily_plant(db)
+    plant_last = daily[-1]["d"] if daily else None
+
     rows = [{
         "date": p.target_date,
         "predicted_mwh": p.predicted_mwh,
@@ -164,11 +201,17 @@ def forecast_history(limit: int = Query(120, ge=1, le=1000),
         "deviation_pct": p.deviation_pct,
         "status": p.status,
         "is_backtest": bool(p.is_backtest),
+        "data_status": _day_status(p.actual_mwh, p.target_date, plant_last),
     } for p in reversed(pts)]
     scored = [r for r in rows if r["actual_mwh"] is not None]
     base = {
         "n_reconciled": len(scored),
         "run_id": run.id,
+        # One run selects one model, so this belongs on the response rather than
+        # repeated down every row.
+        "model": run.model_name,
+        "source": HISTORY_SOURCE,
+        "plant_last_record": plant_last,
         "note": ("Points marked is_backtest were predicted by a model that had not "
                  "seen that day - the held-out test block. Points without an actual "
                  "are days that have not completed yet."),

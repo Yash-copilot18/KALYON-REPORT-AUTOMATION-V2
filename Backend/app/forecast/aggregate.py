@@ -125,6 +125,20 @@ def aggregate_points(points: Iterable[Dict[str, Any]], bucket: str
             deviation = actual - predicted
             deviation_pct = (100.0 * deviation / predicted) if predicted else None
 
+        # How much of the period was actually measured, in one word, from the
+        # counts above rather than a second pass over the data. "Partial" is
+        # the one that matters: it is the period a reader would otherwise take
+        # for a shortfall.
+        has_forecast = any(not r.get("is_backtest") for r in rows)
+        if actual_complete:
+            data_status = "Complete"
+        elif actuals:
+            data_status = "Partial"
+        elif has_forecast:
+            data_status = "Future"
+        else:
+            data_status = "Missing"
+
         statuses = [r.get("status") for r in rows if r.get("status")]
         out.append({
             "bucket": bucket,
@@ -146,7 +160,8 @@ def aggregate_points(points: Iterable[Dict[str, Any]], bucket: str
             "predicted_complete": predicted_complete,
             "comparable": bool(actual_complete and predicted_complete),
             "is_backtest": bool(rows) and all(r.get("is_backtest") for r in rows),
-            "has_forecast_days": any(not r.get("is_backtest") for r in rows),
+            "has_forecast_days": has_forecast,
+            "data_status": data_status,
             "status": statuses[-1] if statuses else None,
             "interval_method": "sum of daily bounds" if bounded else None,
         })

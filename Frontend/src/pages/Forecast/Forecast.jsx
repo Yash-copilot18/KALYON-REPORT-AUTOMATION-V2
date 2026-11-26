@@ -14,6 +14,7 @@ import {
 } from 'recharts'
 import { KpiCard, PageHeader, DataTable, Skeleton, Spinner } from '../../components/Common'
 import DeviceSection from '../../components/Devices/DeviceSection'
+import ForecastDataTable from '../../components/Forecast/ForecastDataTable'
 import {
   fetchForecastStatus, runForecast, fetchForecastLatest, fetchForecastNextDay,
   fetchForecastHistory, fetchForecastDeviations, reconcileForecast,
@@ -115,7 +116,7 @@ export function PeriodTooltip({ active, payload, label, bucket }) {
  * colours, the band and the axis conventions then cannot drift apart between
  * the plant view and a device view.
  */
-export function GenerationChart({ points, bucket }) {
+export function GenerationChart({ points, bucket, selected }) {
   const B = BUCKETS.find(b => b.id === bucket) || BUCKETS[0]
   const data = (points || []).map(p => ({
     // Week and month carry their own label ("02 Jun - 08 Jun", "Jun 2025");
@@ -137,6 +138,12 @@ export function GenerationChart({ points, bucket }) {
                label={{ value: B.unit, angle: -90, position: 'insideLeft',
                         fill: '#7d8da3', fontSize: 10 }} />
         <Tooltip content={<PeriodTooltip bucket={bucket} />} />
+        {/* The row the reader clicked in the table below. The x value is
+            that row's own chart key, so it cannot mark the wrong column. */}
+        {selected && (
+          <ReferenceLine x={selected} stroke="#00d4aa" strokeWidth={1}
+                         strokeDasharray="2 2" ifOverflow="hidden" />
+        )}
         <Legend wrapperStyle={{ fontSize: 11 }} />
         <Area dataKey="band" name="Prediction interval" stroke="none"
               fill="#0b63a8" fillOpacity={0.18} connectNulls={false} />
@@ -177,6 +184,9 @@ export default function Forecast() {
   // 'day' is the original view and stays the default: switching only changes
   // how the same daily series is grouped, never which numbers it holds.
   const [bucket, setBucket]       = useState('day')
+  // The table row the reader clicked, marked on the chart. Held here so
+  // both read one value instead of each keeping its own idea of it.
+  const [selected, setSelected]   = useState(null)
 
   const loadAll = useCallback(async () => {
     setError('')
@@ -240,6 +250,19 @@ export default function Forecast() {
   const rel   = nextDay?.reliability || run?.reliability
   const met   = !!run?.target_met
   const points = history?.points || []
+
+  // The chart keys its x axis on `label || shortDate(date)`. Resolve the
+  // clicked row to that same key off the same array, rather than formatting a
+  // date a second time and hoping the two agree.
+  //
+  // Plain derivation, not useMemo: this runs below the `if (loading) return`
+  // above, and a hook that some renders skip breaks React's hook ordering.
+  const selectedHit = selected
+    ? points.find(p => String(p.date).slice(0, 10) === selected)
+    : null
+  const selectedKey = selectedHit
+    ? (selectedHit.label || shortDate(selectedHit.date))
+    : null
   const BUCKET = BUCKETS.find(b => b.id === bucket) || BUCKETS[0]
 
   return (
@@ -330,13 +353,23 @@ export default function Forecast() {
           </div>
         ) : (
           <div className="h-72">
-            <GenerationChart points={points} bucket={bucket} />
+            <GenerationChart points={points} bucket={bucket}
+                             selected={selectedKey} />
           </div>
         )}
         <PartialNote points={points} bucket={bucket} />
         <div className="text-[11px] text-ge-text3 mt-1">
           {history?.note}
         </div>
+
+        {/* Handed the SAME points array the chart above is drawn from. */}
+        <ForecastDataTable
+          points={points}
+          bucket={bucket}
+          model={history?.model}
+          source={history?.source}
+          selected={selected}
+          onSelect={setSelected} />
       </div>
 
       {/* ── model comparison ─────────────────────────────────────────────── */}
