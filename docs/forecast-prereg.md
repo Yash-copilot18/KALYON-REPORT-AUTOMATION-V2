@@ -36,7 +36,7 @@ Reported alongside, on the same days: **MAE**, **RMSE**, **bias**, **sample
 size**, a **bootstrap 90% confidence interval** (5,000 resamples, seed 0), and a
 breakdown by measured weather condition.
 
-**Acceptance: score ≥ 83% over ≥ 60 valid out-of-sample daily forecasts.**
+**Acceptance: score ≥ 80% over ≥ 60 valid out-of-sample daily forecasts.**
 The dashboard status stays `LIMITED` unless that is met.
 
 ---

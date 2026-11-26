@@ -74,6 +74,49 @@ html:not(.dark) {
            font-sans appearance-none transition-colors duration-150
            focus:outline-none focus:border-ge-blue;
   }
+  /* Native date inputs.
+     `color-scheme` is what actually themes a date field: it tells the browser
+     to draw its own parts - the calendar popup, the picker icon, the spin
+     areas - for a dark surface. Without it Chrome paints a white panel and a
+     near-black icon, invisible on this background. The rules below only cover
+     the parts the page itself owns. */
+  .dark input[type="date"],
+  .dark input[type="datetime-local"],
+  .dark input[type="month"],
+  .dark input[type="time"] { color-scheme: dark; }
+  html:not(.dark) input[type="date"],
+  html:not(.dark) input[type="datetime-local"],
+  html:not(.dark) input[type="month"],
+  html:not(.dark) input[type="time"] { color-scheme: light; }
+
+  /* The icon is the control's only affordance, so it brightens on hover and
+     focus rather than sitting at one fixed weight. */
+  input[type="date"]::-webkit-calendar-picker-indicator {
+    @apply cursor-pointer opacity-60 transition-opacity duration-150;
+  }
+  input[type="date"]:hover::-webkit-calendar-picker-indicator,
+  input[type="date"]:focus-within::-webkit-calendar-picker-indicator {
+    @apply opacity-100;
+  }
+  /* An unfilled date reads as dd-mm-yyyy. That is placeholder text and has to
+     clear contrast rather than fade into the field. */
+  input[type="date"]::-webkit-datetime-edit-text,
+  input[type="date"]::-webkit-datetime-edit-day-field,
+  input[type="date"]::-webkit-datetime-edit-month-field,
+  input[type="date"]::-webkit-datetime-edit-year-field {
+    @apply text-ge-text2;
+  }
+  input[type="date"]:focus::-webkit-datetime-edit-day-field,
+  input[type="date"]:focus::-webkit-datetime-edit-month-field,
+  input[type="date"]:focus::-webkit-datetime-edit-year-field {
+    @apply text-ge-text1;
+  }
+  /* Keyboard focus lands on one sub-field at a time; the accent marks which. */
+  input[type="date"]::-webkit-datetime-edit-day-field:focus,
+  input[type="date"]::-webkit-datetime-edit-month-field:focus,
+  input[type="date"]::-webkit-datetime-edit-year-field:focus {
+    @apply bg-ge-accent/25 text-ge-text1 rounded-sm outline-none;
+  }
   .btn {
     @apply inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-md text-xs font-medium
            transition-all duration-150 cursor-pointer border whitespace-nowrap font-sans

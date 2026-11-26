@@ -29,9 +29,10 @@ from app.models.forecasts import ForecastPoint, ForecastRun
 
 logger = logging.getLogger(__name__)
 
-# The agreed goal. Configurable so the figure in the UI always matches whatever
-# was actually signed off, rather than a constant buried in code.
-TARGET_SCORE_PCT = float(os.getenv("FORECAST_TARGET_SCORE", "83"))
+# The agreed goal, defined once in backtest.py and re-exported here so the
+# score the bootstrap tests against and the score a run is judged by are the
+# same number. Set FORECAST_TARGET_SCORE to change it.
+TARGET_SCORE_PCT = BT.TARGET_SCORE_PCT
 
 # A deviation smaller than this is noise, not an event.
 DEVIATION_PCT_THRESHOLD = float(os.getenv("FORECAST_DEVIATION_PCT", "15"))

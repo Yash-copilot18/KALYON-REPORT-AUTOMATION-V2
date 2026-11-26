@@ -289,6 +289,69 @@ for bucket in ("week", "month"):
           sum(r["days_present"] for r in rows) == len(series),
           "%d of %d" % (sum(r["days_present"] for r in rows), len(series)))
 
+
+# ── data_status: the word the client's table shows per row ──────────────────
+#
+# Four states, and the one that matters is Partial: a period only partly
+# measured must not be read as a shortfall against a whole-period prediction.
+print()
+print("=" * 70)
+print("DATA STATUS")
+print("=" * 70)
+
+from datetime import date as _date, timedelta as _td            # noqa: E402
+
+def _mk(d, predicted=100.0, actual=None, backtest=True):
+    return {"date": d, "predicted_mwh": predicted, "actual_mwh": actual,
+            "lower_mwh": 80.0, "upper_mwh": 120.0, "is_backtest": backtest,
+            "status": None, "deviation_mwh": None, "deviation_pct": None}
+
+# A whole Monday-to-Sunday week, every day measured.
+mon = _date(2024, 4, 1)                       # a Monday
+whole = [_mk(mon + _td(days=i), actual=90.0) for i in range(7)]
+r = AGG.aggregate_points(whole, "week")[0]
+check("a fully measured week is Complete", r["data_status"] == "Complete",
+      r["data_status"])
+check("...and is comparable", r["comparable"] is True)
+
+# The same week with three days measured.
+part = [_mk(mon + _td(days=i), actual=(90.0 if i < 3 else None))
+        for i in range(7)]
+r = AGG.aggregate_points(part, "week")[0]
+check("a partly measured week is Partial", r["data_status"] == "Partial",
+      "%s (%d/%d measured)" % (r["data_status"], r["days_with_actual"],
+                               r["days_in_period"]))
+check("...and is NOT comparable", r["comparable"] is False)
+check("...and withholds a deviation", r["deviation_mwh"] is None)
+check("...and still reports the actual it does have",
+      r["actual_mwh"] == 270.0, r["actual_mwh"])
+
+# A week entirely in the future: predicted, never measured.
+fut = [_mk(mon + _td(days=i), actual=None, backtest=False) for i in range(7)]
+r = AGG.aggregate_points(fut, "week")[0]
+check("an unmeasured forward week is Future", r["data_status"] == "Future",
+      r["data_status"])
+check("...and carries no actual", r["actual_mwh"] is None)
+
+# Held-out days with no actual reconciled: inside the archive, not measured.
+miss = [_mk(mon + _td(days=i), actual=None, backtest=True) for i in range(7)]
+r = AGG.aggregate_points(miss, "week")[0]
+check("a backtest week with no actuals is Missing",
+      r["data_status"] == "Missing", r["data_status"])
+
+# Never zero: a missing reading must stay missing through aggregation.
+check("a missing actual never becomes 0.0",
+      all(AGG.aggregate_points(miss, b)[0]["actual_mwh"] is None
+          for b in ("week", "month")))
+
+# Every bucket emits the field, so the table never renders undefined.
+for bucket in ("day", "week", "month"):
+    rows = AGG.aggregate_points(series, bucket)
+    check("%-5s emits data_status on every row" % bucket,
+          all(r.get("data_status") in
+              ("Complete", "Partial", "Future", "Missing") for r in rows),
+          sorted({r.get("data_status") for r in rows}))
+
 print()
 print("=" * 70)
 print("%d passed, %d failed" % (_passed, _failed))
