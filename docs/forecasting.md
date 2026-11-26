@@ -21,8 +21,8 @@ Scored once against `docs/forecast-prereg.md`, which was written before the run.
 | **SCORE** | **70.0%** |
 | WAPE / MAE / RMSE / bias | 30.0% / 201 MWh / 274 MWh / +6 MWh |
 | 90% confidence interval | 63.6% – 75.5% |
-| P(score ≥ 83%) | **0%** |
-| **Target 83% — MET** | **NO** |
+| P(score ≥ 80%) | **0.04%** |
+| **Target 80% — MET** | **NO** |
 
 Comparison on identical dates (reported only; never used for selection):
 

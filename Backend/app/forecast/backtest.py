@@ -50,6 +50,12 @@ MIN_CREDIBLE_TEST_DAYS = int(os.getenv("MIN_CREDIBLE_TEST_DAYS", "30"))
 
 TEST_FRACTION = 0.20    # final untouched block, as a share of all rows
 
+# The agreed acceptance score. Defined here, not in service.py, so the
+# bootstrap below and the run that reports target_met cannot drift apart;
+# service imports this one. Configurable, because the figure on the
+# dashboard has to be whatever was actually signed off.
+TARGET_SCORE_PCT = float(os.getenv("FORECAST_TARGET_SCORE", "80"))
+
 
 # ── parallel fitting ─────────────────────────────────────────────────────────
 #
@@ -477,5 +483,10 @@ def bootstrap_ci(records: List[Dict[str, Any]], alpha: float = 0.10,
         "upper_pct": float(np.percentile(v, 100 * (1 - alpha / 2))),
         "confidence_pct": (1 - alpha) * 100,
         "n_boot": n_boot, "seed": seed,
-        "p_meets_83": float(np.mean(v >= 83.0)),
+        # Named for the target rather than for a particular number: the
+        # figure is configurable, and a key with the number baked into it
+        # goes stale the moment the target moves. `target_pct` records
+        # which value this probability was computed against.
+        "target_pct": TARGET_SCORE_PCT,
+        "p_meets_target": float(np.mean(v >= TARGET_SCORE_PCT)),
     }
