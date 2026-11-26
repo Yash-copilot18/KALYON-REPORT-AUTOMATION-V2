@@ -16,6 +16,7 @@ from datetime import datetime
 
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 
+from app.services import dedup, schema_cache
 from app.database.session import get_db
 from app.schemas.reports_schema import ReportDataRequest, MultiReportRequest
 from app.services.reports_service import ReportsService
@@ -834,9 +835,14 @@ def get_summary(req: ReportDataRequest, db: Session = Depends(get_db)):
             f"SUM(CAST([{col}] AS FLOAT)) AS [{col}_sum]",
         ])
 
+    # record_count and the per-tag SUM both counted a retransmitted poll twice;
+    # the AVG was weighted by it. See services/dedup.
+    _stats_src = dedup.source(table, column_names,
+                              schema_cache.get_columns(db, table) or {},
+                              where="TimeCol BETWEEN :from_dt AND :to_dt")
     sql = text(f"""
         SELECT COUNT(*) AS record_count, {', '.join(agg_parts)}
-        FROM [{table}]
+        FROM {_stats_src}
         WHERE TimeCol BETWEEN :from_dt AND :to_dt
     """)
     try:

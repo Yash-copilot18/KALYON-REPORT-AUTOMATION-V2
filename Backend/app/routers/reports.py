@@ -5,12 +5,20 @@ from sqlalchemy import text
 import logging
 from datetime import datetime
 
+from app.services import dedup, schema_cache
 from app.database.session import get_db
 from app.schemas.reports import ReportRequest, ExportRequest
 from app.services.report_service import ReportService
 from app.services.report_files import build_report_csv, fmt_timestamp, PROJECT_NAME
 
 logger = logging.getLogger(__name__)
+
+# The tags the inverter summary reads. Named here so the de-duplication covers
+# exactly the columns the summary aggregates.
+_SUMMARY_TAGS = [
+    "DC_VOLTAGE", "DC_CURRENT", "ACTIVE_POWER", "DAILY_ENERGY",
+    "MONTHLY_ENERGY", "MV_TRAFO_TEMP", "PRIMEPACK_IGBT_HEATSINK_TEMP",
+]
 
 router = APIRouter(
     prefix="/reports",
@@ -83,7 +91,8 @@ def inverter_summary(
             MAX(CAST(MONTHLY_ENERGY AS FLOAT)) AS max_monthly_energy,
             AVG(CAST(MV_TRAFO_TEMP AS FLOAT)) AS avg_mv_trafo_temp,
             MAX(CAST(PRIMEPACK_IGBT_HEATSINK_TEMP AS FLOAT)) AS max_igbt_temp
-        FROM [{table}]
+        FROM {dedup.source(table, _SUMMARY_TAGS, schema_cache.get_columns(db, table) or {},
+                           where="TimeCol BETWEEN :from_dt AND :to_dt")}
         WHERE TimeCol BETWEEN :from_dt AND :to_dt
     """)
     row = db.execute(sql, {"from_dt": from_dt, "to_dt": to_dt}).fetchone()
@@ -116,7 +125,7 @@ def wms_latest(db: Session = Depends(get_db)):
             AVG_IR_SOILING_RATIO1, AVG_IR_SOILING_RATIO2,
             AVG_PRECIPITATION_INTENSITY
         FROM [WMS]
-        ORDER BY TimeCol DESC
+        ORDER BY TimeCol DESC, MSecCol DESC
     """)
     row = db.execute(sql).fetchone()
     if not row:
@@ -151,7 +160,7 @@ def ppc_latest(db: Session = Depends(get_db)):
             PLANT_DAILY_PRODUCTION, PLANT_MONTHLY_PRODUCTION,
             PLANT_YEARLY_PRODUCTION, PLANT_LIFETIME_PRODUCTION
         FROM [PPC]
-        ORDER BY TimeCol DESC
+        ORDER BY TimeCol DESC, MSecCol DESC
     """)
     row = db.execute(sql).fetchone()
     if not row:

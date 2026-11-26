@@ -26,7 +26,7 @@ def get_equipment_live(db: Session = Depends(get_db)):
                     MV_TRAFO_TEMP,
                     DAILY_RUN_MIN, DOWN_TIME_MIN, OK_TIME_MIN
                 FROM [{table}]
-                ORDER BY TimeCol DESC
+                ORDER BY TimeCol DESC, MSecCol DESC
             """)
             row = db.execute(sql).fetchone()
 
@@ -70,7 +70,7 @@ def get_equipment_live(db: Session = Depends(get_db)):
                 ALL_WMS_AVG_MODULE_TEMP,
                 AVG_WIND_SPEED
             FROM [WMS]
-            ORDER BY TimeCol DESC
+            ORDER BY TimeCol DESC, MSecCol DESC
         """)
         wms = db.execute(wms_sql).fetchone()
 
@@ -122,7 +122,7 @@ def get_inverter_live(inverter_no: int, db: Session = Depends(get_db)):
                 STRING_CURRENT1, STRING_CURRENT2, STRING_CURRENT3,
                 STRING_CURRENT4, STRING_CURRENT5
             FROM [{table}]
-            ORDER BY TimeCol DESC
+            ORDER BY TimeCol DESC, MSecCol DESC
         """)
         row = db.execute(sql).fetchone()
         if not row:

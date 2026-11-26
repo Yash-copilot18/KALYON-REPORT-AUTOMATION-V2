@@ -234,7 +234,7 @@ def _compute_snapshot(db: Session, table: str) -> Dict:
     col_sql = ", ".join(f"[{c}]" for c in cols)
     # ONE row, newest first — clustered index on TimeCol makes this an index seek.
     row = db.execute(text(
-        f"SELECT TOP 1 TimeCol, {col_sql} FROM [{table}] ORDER BY TimeCol DESC"
+        f"SELECT TOP 1 TimeCol, {col_sql} FROM [{table}] ORDER BY TimeCol DESC, MSecCol DESC"
     )).fetchone()
 
     if row is None:

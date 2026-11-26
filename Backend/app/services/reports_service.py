@@ -13,7 +13,7 @@ from sqlalchemy import text
 from app.repositories.reports_repository import (
     ReportsRepository, EQUIPMENT_REGISTRY, _safe_name, _build_interval_expr,
 )
-from app.services import schema_cache, intervals, isolator_columns
+from app.services import schema_cache, intervals, isolator_columns, dedup
 from app.schemas.reports_schema import ReportDataRequest
 from app.database.session import SessionLocal
 
@@ -300,15 +300,19 @@ class ReportsService:
         if not active_ids:
             return []
         agg_interval = not intervals.is_instant(interval)
-        grp = _build_interval_expr(interval) if agg_interval else "TimeCol"
+        # Instant keys group on the second, not on the raw row. A retransmitted
+        # poll would otherwise contribute two identical keys while the row query
+        # and the row count (both de-duplicated) return one record, and the page
+        # offsets would drift apart. `ts` is only ever used as a lower bound for
+        # each device's fetch window, so truncating it to the second is safe.
+        grp = _build_interval_expr(interval) if agg_interval else dedup.SECOND_KEY
         parts = []
         for i, eid in enumerate(active_ids):
             if not _safe_name(eid):
                 continue
-            grp_by = f" GROUP BY {grp}" if agg_interval else ""
             parts.append(
                 f"SELECT {grp} AS ts, {i} AS eord FROM [{eid}] "
-                f"WHERE TimeCol BETWEEN :a AND :b{grp_by}"
+                f"WHERE TimeCol BETWEEN :a AND :b GROUP BY {grp}"
             )
         if not parts:
             return []

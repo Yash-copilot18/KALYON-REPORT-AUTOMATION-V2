@@ -47,11 +47,28 @@ from typing import List, Tuple, Optional, Callable, Iterator
 from sqlalchemy import text
 
 from app.database.session import SessionLocal
-from app.services import schema_cache, intervals, isolator_columns
+from app.services import schema_cache, intervals, isolator_columns, dedup
 from app.services.smb_excel import _TEXT_TYPES                 # shared text-column set
 from app.repositories.reports_repository import _safe_name, _build_interval_expr
 
 logger = logging.getLogger(__name__)
+
+# Range predicate of every export query, named so it can be pushed inside the
+# de-duplicating derived table where it still uses the clustered TimeCol index.
+_RANGE = "TimeCol BETWEEN :f AND :t"
+
+
+def _agg_src(table, cols, col_types, agg):
+    """FROM target for a bucketed export.
+
+    SUM is the only aggregation a retransmitted poll corrupts - it adds the same
+    measurement twice. AVG/MIN/MAX cannot, so they read the table directly.
+    """
+    if str(agg or "").lower() != "sum":
+        return f"[{table}]"
+    return dedup.source(table, cols, col_types, where=_RANGE)
+
+
 
 XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 ZIP_MIME  = "application/zip"
@@ -103,8 +120,9 @@ def _iter_table_rows(db, table, cols, col_types, from_dt, to_dt, interval, agg,
 
     if intervals.is_instant(interval):
         select = ", ".join(f"[{c}]" for c in cols)
-        base = (f"SELECT TimeCol, {select} FROM [{table}] "
-                f"WHERE TimeCol BETWEEN :f AND :t ORDER BY TimeCol")
+        base = (f"SELECT TimeCol, {select} "
+                f"FROM {dedup.source(table, cols, col_types, where=_RANGE)} "
+                f"WHERE TimeCol BETWEEN :f AND :t ORDER BY {dedup.order_by()}")
     else:
         grp = _build_interval_expr(interval)
         parts = []
@@ -119,7 +137,8 @@ def _iter_table_rows(db, table, cols, col_types, from_dt, to_dt, interval, agg,
                     "sum": f"SUM(CAST([{c}] AS FLOAT))",
                 }.get(agg, f"AVG(CAST([{c}] AS FLOAT))")
                 parts.append(f"{fn} AS [{c}]")
-        base = (f"SELECT {grp} AS TimeCol, {', '.join(parts)} FROM [{table}] "
+        base = (f"SELECT {grp} AS TimeCol, {', '.join(parts)} "
+                f"FROM {_agg_src(table, cols, col_types, agg)} "
                 f"WHERE TimeCol BETWEEN :f AND :t GROUP BY {grp} ORDER BY {grp}")
 
     # ONE query; stream it in batches straight off the cursor (never buffer it all).
