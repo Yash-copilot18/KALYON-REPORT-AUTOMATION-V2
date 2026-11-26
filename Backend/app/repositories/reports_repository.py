@@ -9,7 +9,7 @@ import logging
 import time
 import re
 
-from app.services import schema_cache, intervals
+from app.services import schema_cache, intervals, dedup
 
 logger = logging.getLogger(__name__)
 
@@ -594,12 +594,18 @@ class ReportsRepository:
         if not _safe_name(table):
             raise HTTPException(400, detail=f"Invalid table: {table!r}")
         params = {"from_dt": from_datetime, "to_dt": to_datetime}
+        col_types = schema_cache.get_columns(db, table) or {}
+        rng = "TimeCol BETWEEN :from_dt AND :to_dt"
         if intervals.is_instant(interval):
-            sql = f"SELECT COUNT(*) FROM [{table}] WHERE TimeCol BETWEEN :from_dt AND :to_dt"
+            # Counts the records the instant page will actually return, which is
+            # one per (device, tag, second) - not the raw row count, which on a
+            # retransmitted day reported 2,880 records for 1,440 minutes.
+            src = dedup.count_source(table, col_types, where=rng)
+            sql = f"SELECT COUNT(*) FROM {src} WHERE {rng}"
         else:
             grp = _build_interval_expr(interval)
             sql = (f"SELECT COUNT(*) FROM (SELECT {grp} AS ts FROM [{table}] "
-                   f"WHERE TimeCol BETWEEN :from_dt AND :to_dt GROUP BY {grp}) x")
+                   f"WHERE {rng} GROUP BY {grp}) x")
         return int(db.execute(text(sql), params).scalar() or 0)
 
     @staticmethod
@@ -699,19 +705,27 @@ class ReportsRepository:
 
         t_query0 = time.perf_counter()
 
+        rng = "TimeCol BETWEEN :from_dt AND :to_dt"
+
         if intervals.is_instant(interval):  # instant SCADA data, no aggregation
             # Raw rows: only this page's rows are read (index seek on TimeCol),
             # and only the selected columns are projected.
+            #
+            # Instant means "every measurement the plant recorded", not "every row
+            # the historian wrote". A retransmitted poll is the same measurement
+            # arriving twice, and at the second precision this page displays the
+            # two rows are indistinguishable, so one is kept - see services/dedup.
             col_select = ", ".join([f"[{t}]" for t in tags])
+            src = dedup.source(table, tags, col_types, where=rng)
             total = (db.execute(text(f"""
-                SELECT COUNT(*) FROM [{table}]
-                WHERE TimeCol BETWEEN :from_dt AND :to_dt
+                SELECT COUNT(*) FROM {dedup.count_source(table, col_types, where=rng)}
+                WHERE {rng}
             """), base_params).scalar() or 0) if compute_total else 0
             rows = db.execute(text(f"""
                 SELECT TimeCol, {col_select}
-                FROM [{table}]
-                WHERE TimeCol BETWEEN :from_dt AND :to_dt
-                ORDER BY TimeCol
+                FROM {src}
+                WHERE {rng}
+                ORDER BY {dedup.order_by()}
                 OFFSET :offset ROWS FETCH NEXT :limit ROWS ONLY
             """), page_params).fetchall()
         else:
@@ -768,9 +782,17 @@ class ReportsRepository:
                         }.get(agg_function, f"AVG(CAST([{t}] AS FLOAT))")
                         agg_parts.append(f"{fn} AS [{t}]")
 
+                # SUM is the one aggregation a retransmitted poll corrupts: it adds
+                # the same measurement twice, which turned 2024-05-07 into 2,242 MWh
+                # against a metered 1,137. AVG/MIN/MAX cannot double-count, and the
+                # forecast deliberately averages both polls of a minute, so they read
+                # the table directly and keep the query plan these pages were tuned
+                # for. See services/dedup.
+                agg_src = (dedup.source(table, tags, col_types, where=win_clause)
+                           if agg_function == "sum" else f"[{table}]")
                 rows = db.execute(text(f"""
                     SELECT {grp} AS TimeCol, {', '.join(agg_parts)}
-                    FROM [{table}]
+                    FROM {agg_src}
                     WHERE {win_clause}
                     GROUP BY {grp}
                     ORDER BY {grp}

@@ -126,8 +126,8 @@ def forecast_next_day(db: Session = Depends(get_db)) -> Dict[str, Any]:
         "made_on": pt.made_on,
         "score_pct": run.score_pct,
         "wape_pct": run.wape_pct,
-        "target_score_pct": run.target_score_pct,
-        "target_met": bool(run.target_met),
+        "target_score_pct": _target_pct(run),
+        "target_met": _target_met(run),
         "weather_forecast_used": bool(run.weather_forecast_used),
         "reliability": _reliability(run),
     }
@@ -330,6 +330,23 @@ def forecast_acceptance(db: Session = Depends(get_db)) -> Dict[str, Any]:
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
+def _target_pct(run: ForecastRun) -> float:
+    """The target in force now, not the one frozen into the row.
+
+    Each run records the target it was judged against at the time, which is
+    the right thing for the stored history. It is the wrong thing to display:
+    a database holding runs from either side of a target change would show two
+    different targets on the same dashboard. The column stays as the record;
+    the screen shows the one target that is currently agreed.
+    """
+    return S.TARGET_SCORE_PCT
+
+
+def _target_met(run: ForecastRun) -> bool:
+    """Re-judged against the current target. The score itself is never touched."""
+    return bool(run.score_pct is not None and run.score_pct >= S.TARGET_SCORE_PCT)
+
+
 def _reliability(run: ForecastRun) -> Dict[str, Any]:
     """
     A plain verdict on whether the forecast should be acted upon.
@@ -340,15 +357,16 @@ def _reliability(run: ForecastRun) -> Dict[str, Any]:
     score = run.score_pct
     if score is None:
         return {"level": "UNKNOWN", "reason": "No score was measured."}
-    if run.target_met:
+    target = _target_pct(run)
+    if _target_met(run):
         return {"level": "VALIDATED",
                 "reason": f"Held-out score {score:.1f}% meets the "
-                          f"{run.target_score_pct:.0f}% target."}
-    gap = (run.target_score_pct or 0) - score
+                          f"{target:.0f}% target."}
+    gap = target - score
     return {
         "level": "LIMITED",
         "reason": (f"Held-out score {score:.1f}% is {gap:.1f} points below the "
-                   f"{run.target_score_pct:.0f}% target. Use for direction, not "
+                   f"{target:.0f}% target. Use for direction, not "
                    f"for commitment."),
     }
 
@@ -366,8 +384,8 @@ def _run_summary(run: ForecastRun) -> Dict[str, Any]:
         "score_pct": run.score_pct, "wape_pct": run.wape_pct,
         "mae_mwh": run.mae_mwh, "rmse_mwh": run.rmse_mwh,
         "bias_mwh": run.bias_mwh, "r2": run.r2,
-        "target_score_pct": run.target_score_pct,
-        "target_met": bool(run.target_met),
+        "target_score_pct": _target_pct(run),
+        "target_met": _target_met(run),
         "weather_forecast_used": bool(run.weather_forecast_used),
         "reliability": _reliability(run),
     }

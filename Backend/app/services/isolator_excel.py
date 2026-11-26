@@ -24,13 +24,13 @@ export endpoint (any T*_IS* table).
 import io
 import time
 import logging
-from typing import List, Sequence, Tuple, Optional, Callable
+from typing import List, Sequence, Tuple, Optional, Callable, Dict
 
 import xlsxwriter
 from sqlalchemy import text
 
 from app.database.session import SessionLocal
-from app.services import schema_cache, isolator_columns as ic, intervals
+from app.services import schema_cache, isolator_columns as ic, intervals, dedup
 from app.services import report_excel as _report_excel  # noqa: F401 — installs faster .xlsx zip packaging
 from app.repositories.reports_repository import _build_interval_expr
 
@@ -101,24 +101,34 @@ def _make_formats(wb):
 
 # ── Dynamic, parameterized SQL (never SELECT *) ──────────────────────────────
 def _build_sql(table: str, param_cols: List[str], ts_cols: Sequence[str],
-               interval: str, agg: str) -> str:
+               interval: str, agg: str,
+               col_types: Optional[Dict[str, str]] = None) -> str:
     """
     Projection is always: <ts_cols…> then the selected trackers' six params.
     ts_cols[0] must be TimeCol. Row shape is fixed so the pivot can slice params
     from a constant offset. Dates are bound parameters.
     """
+    types = col_types or {}
+    rng = "TimeCol BETWEEN :from_dt AND :to_dt"
+
     if intervals.is_instant(interval):
+        # Instant export: one record per (tracker, param, second). A retransmitted
+        # poll is the same reading arriving twice - see services/dedup.
         select = ", ".join([f"[{c}]" for c in ts_cols] + [f"[{c}]" for c in param_cols])
-        return (f"SELECT {select} FROM [{table}] "
-                f"WHERE TimeCol BETWEEN :from_dt AND :to_dt "
-                f"ORDER BY TimeCol OFFSET 0 ROWS FETCH NEXT :cap ROWS ONLY")
+        src = dedup.source(table, list(ts_cols) + list(param_cols), types, where=rng)
+        return (f"SELECT {select} FROM {src} "
+                f"WHERE {rng} "
+                f"ORDER BY {dedup.order_by()} OFFSET 0 ROWS FETCH NEXT :cap ROWS ONLY")
 
     grp = _build_interval_expr(interval)
     fn = {"avg": "AVG", "min": "MIN", "max": "MAX", "sum": "SUM"}.get(agg, "AVG")
     # First ts col is the bucket key; any others (e.g. LocalCol) carry MIN per bucket.
     ts_select = [f"{grp} AS TimeCol"] + [f"MIN([{c}]) AS [{c}]" for c in ts_cols[1:]]
     aggs = [f"{fn}(CAST([{c}] AS FLOAT)) AS [{c}]" for c in param_cols]
-    return (f"SELECT {', '.join(ts_select + aggs)} FROM [{table}] "
+    # SUM is the only aggregation a retransmission corrupts.
+    agg_src = (dedup.source(table, list(ts_cols) + list(param_cols), types, where=rng)
+               if fn == "SUM" else f"[{table}]")
+    return (f"SELECT {', '.join(ts_select + aggs)} FROM {agg_src} "
             f"WHERE TimeCol BETWEEN :from_dt AND :to_dt "
             f"GROUP BY {grp} ORDER BY {grp} "
             f"OFFSET 0 ROWS FETCH NEXT :cap ROWS ONLY")
@@ -207,7 +217,8 @@ def build_workbook(
         param_cols = ic.columns_for_ids(ids, valid_cols)   # 6 per tracker, in order
         per = ic.PER_UNIT
         n_ts = len(ts_cols)
-        sql = _build_sql(table, param_cols, ts_cols, interval, agg)
+        sql = _build_sql(table, param_cols, ts_cols, interval, agg,
+                         schema_cache.get_columns(db, table))
 
         if progress:
             progress(2, f"Querying {len(ids)} tracker(s) from {table}…")

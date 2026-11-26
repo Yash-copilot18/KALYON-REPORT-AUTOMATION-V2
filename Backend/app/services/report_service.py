@@ -10,8 +10,55 @@ import logging
 from app.schemas.reports import (
     ReportRequest, ReportType, TimeInterval, AggFunction
 )
+from app.services import dedup, schema_cache
 
 logger = logging.getLogger(__name__)
+
+# The range predicate every report here uses. Named so it can be pushed inside
+# the de-duplicating derived table, where it keeps the TimeCol index seek.
+_RANGE = "TimeCol BETWEEN :from_dt AND :to_dt"
+
+
+def _all_tags(db: Session, table: str) -> List[str]:
+    """Every measurement column of `table`, read from the schema cache.
+
+    Used where the report selects a fixed set built from a numeric range rather
+    than a named tag list, so the de-duplication covers the same columns the
+    report shows without restating them here.
+    """
+    return dedup.tag_columns(schema_cache.get_columns(db, table) or {})
+
+
+def _raw_from(db: Session, table: str, tags: List[str]) -> str:
+    """FROM target for a RAW page: one record per (device, tag, second).
+
+    RAW means every measurement the plant recorded, which is not the same as
+    every row the historian wrote - a retransmitted poll arrives 10-40 ms later
+    and renders as the same timestamp at the second precision these reports
+    display. See services/dedup for the evidence and the retention rule.
+    """
+    return dedup.source(table, tags, schema_cache.get_columns(db, table) or {},
+                        where=_RANGE)
+
+
+def _raw_count_from(db: Session, table: str) -> str:
+    """FROM target for `total_records` on a RAW page - counts retained records."""
+    return dedup.count_source(table, schema_cache.get_columns(db, table) or {},
+                              where=_RANGE)
+
+
+def _agg_from(db: Session, table: str, tags: List[str], agg) -> str:
+    """FROM target for an aggregated page.
+
+    Only SUM needs the duplicate removed: it is the one aggregation that counts a
+    retransmitted measurement twice. AVG/MIN/MAX cannot, so they read the table
+    directly and keep the existing query plan.
+    """
+    code = str(getattr(agg, "value", agg) or "").lower()
+    if code != "sum":
+        return f"[{table}]"
+    return dedup.source(table, tags, schema_cache.get_columns(db, table) or {},
+                        where=_RANGE)
 
 # All 24 inverter table names
 INVERTER_TABLES = [f"INVERTER_{str(i).zfill(2)}" for i in range(1, 25)]
@@ -142,14 +189,14 @@ class ReportService:
         if req.interval == TimeInterval.RAW:
             col_select = ", ".join([f"[{t}]" for t in tags])
             count_sql  = text(f"""
-                SELECT COUNT(*) FROM [{table}]
-                WHERE TimeCol BETWEEN :from_dt AND :to_dt
+                SELECT COUNT(*) FROM {_raw_count_from(db, table)}
+                WHERE {_RANGE}
             """)
             data_sql = text(f"""
                 SELECT TimeCol, {col_select}
-                FROM [{table}]
-                WHERE TimeCol BETWEEN :from_dt AND :to_dt
-                ORDER BY TimeCol
+                FROM {_raw_from(db, table, tags)}
+                WHERE {_RANGE}
+                ORDER BY {dedup.order_by()}
                 OFFSET :offset ROWS FETCH NEXT :page_size ROWS ONLY
             """)
             columns = ["timestamp"] + tags
@@ -168,8 +215,8 @@ class ReportService:
             """)
             data_sql = text(f"""
                 SELECT {grp} AS TimeCol, {agg_cols}
-                FROM [{table}]
-                WHERE TimeCol BETWEEN :from_dt AND :to_dt
+                FROM {_agg_from(db, table, tags, req.agg_function)}
+                WHERE {_RANGE}
                 GROUP BY {grp}
                 ORDER BY {grp}
                 OFFSET :offset ROWS FETCH NEXT :page_size ROWS ONLY
@@ -215,13 +262,13 @@ class ReportService:
 
         sql = text(f"""
             SELECT TimeCol, {inv_cols}, ({grand_total}) AS GRAND_TOTAL
-            FROM [INVERTER_DAILY_GEN]
-            WHERE TimeCol BETWEEN :from_dt AND :to_dt
-            ORDER BY TimeCol
+            FROM {_raw_from(db, 'INVERTER_DAILY_GEN', _all_tags(db, 'INVERTER_DAILY_GEN'))}
+            WHERE {_RANGE}
+            ORDER BY {dedup.order_by()}
             OFFSET :offset ROWS FETCH NEXT :page_size ROWS ONLY
         """)
-        count_sql = text("""
-            SELECT COUNT(*) FROM [INVERTER_DAILY_GEN]
+        count_sql = text(f"""
+            SELECT COUNT(*) FROM {_raw_count_from(db, 'INVERTER_DAILY_GEN')}
             WHERE TimeCol BETWEEN :from_dt AND :to_dt
         """)
 
@@ -267,13 +314,13 @@ class ReportService:
 
         sql = text(f"""
             SELECT TimeCol, {inv_cols}, ({grand_total}) AS GRAND_TOTAL
-            FROM [INVERTER_MONTHLY_GEN]
-            WHERE TimeCol BETWEEN :from_dt AND :to_dt
-            ORDER BY TimeCol
+            FROM {_raw_from(db, 'INVERTER_MONTHLY_GEN', _all_tags(db, 'INVERTER_MONTHLY_GEN'))}
+            WHERE {_RANGE}
+            ORDER BY {dedup.order_by()}
             OFFSET :offset ROWS FETCH NEXT :page_size ROWS ONLY
         """)
-        count_sql = text("""
-            SELECT COUNT(*) FROM [INVERTER_MONTHLY_GEN]
+        count_sql = text(f"""
+            SELECT COUNT(*) FROM {_raw_count_from(db, 'INVERTER_MONTHLY_GEN')}
             WHERE TimeCol BETWEEN :from_dt AND :to_dt
         """)
 
@@ -320,9 +367,9 @@ class ReportService:
         if req.interval == TimeInterval.RAW:
             sql = text(f"""
                 SELECT TimeCol, {inv_cols}, ({total_power}) AS TOTAL_POWER
-                FROM [POWER_GRAPH]
-                WHERE TimeCol BETWEEN :from_dt AND :to_dt
-                ORDER BY TimeCol
+                FROM {_raw_from(db, 'POWER_GRAPH', _all_tags(db, 'POWER_GRAPH'))}
+                WHERE {_RANGE}
+                ORDER BY {dedup.order_by()}
                 OFFSET :offset ROWS FETCH NEXT :page_size ROWS ONLY
             """)
         else:
@@ -333,15 +380,15 @@ class ReportService:
             ])
             sql = text(f"""
                 SELECT {grp} AS TimeCol, {agg_cols}
-                FROM [POWER_GRAPH]
-                WHERE TimeCol BETWEEN :from_dt AND :to_dt
+                FROM {_agg_from(db, 'POWER_GRAPH', _all_tags(db, 'POWER_GRAPH'), req.agg_function)}
+                WHERE {_RANGE}
                 GROUP BY {grp}
                 ORDER BY {grp}
                 OFFSET :offset ROWS FETCH NEXT :page_size ROWS ONLY
             """)
 
-        count_sql = text("""
-            SELECT COUNT(*) FROM [POWER_GRAPH]
+        count_sql = text(f"""
+            SELECT COUNT(*) FROM {_raw_count_from(db, 'POWER_GRAPH')}
             WHERE TimeCol BETWEEN :from_dt AND :to_dt
         """)
 
@@ -385,15 +432,15 @@ class ReportService:
     def get_power_vs_irradiance(db: Session, req: ReportRequest) -> Dict[str, Any]:
         tags = ["POWER_GENERATION", "AVG_ALBEDO_UP_CUMM_IRRADIATION", "AVG_GHI_IRRADIATION"]
 
-        sql = text("""
+        sql = text(f"""
             SELECT TimeCol, POWER_GENERATION, AVG_ALBEDO_UP_CUMM_IRRADIATION, AVG_GHI_IRRADIATION
-            FROM [POWER_VS_IRRADIANCE]
-            WHERE TimeCol BETWEEN :from_dt AND :to_dt
-            ORDER BY TimeCol
+            FROM {_raw_from(db, 'POWER_VS_IRRADIANCE', tags)}
+            WHERE {_RANGE}
+            ORDER BY {dedup.order_by()}
             OFFSET :offset ROWS FETCH NEXT :page_size ROWS ONLY
         """)
-        count_sql = text("""
-            SELECT COUNT(*) FROM [POWER_VS_IRRADIANCE]
+        count_sql = text(f"""
+            SELECT COUNT(*) FROM {_raw_count_from(db, 'POWER_VS_IRRADIANCE')}
             WHERE TimeCol BETWEEN :from_dt AND :to_dt
         """)
 
@@ -441,9 +488,9 @@ class ReportService:
         if req.interval == TimeInterval.RAW:
             sql = text(f"""
                 SELECT TimeCol, {col_select}
-                FROM [PPC]
-                WHERE TimeCol BETWEEN :from_dt AND :to_dt
-                ORDER BY TimeCol
+                FROM {_raw_from(db, 'PPC', tags)}
+                WHERE {_RANGE}
+                ORDER BY {dedup.order_by()}
                 OFFSET :offset ROWS FETCH NEXT :page_size ROWS ONLY
             """)
         else:
@@ -451,14 +498,14 @@ class ReportService:
             agg_cols = ", ".join([f"{build_agg(t, req.agg_function)} AS [{t}]" for t in tags])
             sql = text(f"""
                 SELECT {grp} AS TimeCol, {agg_cols}
-                FROM [PPC]
-                WHERE TimeCol BETWEEN :from_dt AND :to_dt
+                FROM {_agg_from(db, 'PPC', tags, req.agg_function)}
+                WHERE {_RANGE}
                 GROUP BY {grp}
                 ORDER BY {grp}
                 OFFSET :offset ROWS FETCH NEXT :page_size ROWS ONLY
             """)
 
-        count_sql = text("SELECT COUNT(*) FROM [PPC] WHERE TimeCol BETWEEN :from_dt AND :to_dt")
+        count_sql = text(f"SELECT COUNT(*) FROM {_raw_count_from(db, 'PPC')} WHERE {_RANGE}")
 
         params = {
             "from_dt":   req.from_datetime,
@@ -502,9 +549,9 @@ class ReportService:
         if req.interval == TimeInterval.RAW:
             sql = text(f"""
                 SELECT TimeCol, {col_select}
-                FROM [WMS]
-                WHERE TimeCol BETWEEN :from_dt AND :to_dt
-                ORDER BY TimeCol
+                FROM {_raw_from(db, 'WMS', tags)}
+                WHERE {_RANGE}
+                ORDER BY {dedup.order_by()}
                 OFFSET :offset ROWS FETCH NEXT :page_size ROWS ONLY
             """)
         else:
@@ -512,14 +559,14 @@ class ReportService:
             agg_cols = ", ".join([f"{build_agg(t, req.agg_function)} AS [{t}]" for t in tags])
             sql = text(f"""
                 SELECT {grp} AS TimeCol, {agg_cols}
-                FROM [WMS]
-                WHERE TimeCol BETWEEN :from_dt AND :to_dt
+                FROM {_agg_from(db, 'WMS', tags, req.agg_function)}
+                WHERE {_RANGE}
                 GROUP BY {grp}
                 ORDER BY {grp}
                 OFFSET :offset ROWS FETCH NEXT :page_size ROWS ONLY
             """)
 
-        count_sql = text("SELECT COUNT(*) FROM [WMS] WHERE TimeCol BETWEEN :from_dt AND :to_dt")
+        count_sql = text(f"SELECT COUNT(*) FROM {_raw_count_from(db, 'WMS')} WHERE {_RANGE}")
 
         params = {
             "from_dt":   req.from_datetime,
@@ -557,7 +604,7 @@ class ReportService:
             SELECT TimeCol, EventCol, DescCol, EvDescCol, DurCol, CommCol, UniID, TraID
             FROM [Alarms]
             WHERE TimeCol BETWEEN :from_dt AND :to_dt
-            ORDER BY TimeCol DESC
+            ORDER BY TimeCol DESC, MSecCol DESC
             OFFSET :offset ROWS FETCH NEXT :page_size ROWS ONLY
         """)
         count_sql = text("SELECT COUNT(*) FROM [Alarms] WHERE TimeCol BETWEEN :from_dt AND :to_dt")
@@ -616,13 +663,13 @@ class ReportService:
 
         sql = text(f"""
             SELECT TimeCol, {col_select}
-            FROM [TEMPERATURE_REPORT]
-            WHERE TimeCol BETWEEN :from_dt AND :to_dt
-            ORDER BY TimeCol
+            FROM {_raw_from(db, 'TEMPERATURE_REPORT', tags)}
+            WHERE {_RANGE}
+            ORDER BY {dedup.order_by()}
             OFFSET :offset ROWS FETCH NEXT :page_size ROWS ONLY
         """)
-        count_sql = text("""
-            SELECT COUNT(*) FROM [TEMPERATURE_REPORT]
+        count_sql = text(f"""
+            SELECT COUNT(*) FROM {_raw_count_from(db, 'TEMPERATURE_REPORT')}
             WHERE TimeCol BETWEEN :from_dt AND :to_dt
         """)
 
@@ -671,7 +718,7 @@ class ReportService:
                     GRID_VOLTAGE_L_L_MEASURED,
                     GRID_PF_MEASURED
                 FROM [PPC]
-                ORDER BY TimeCol DESC
+                ORDER BY TimeCol DESC, MSecCol DESC
             """)
             ppc = db.execute(ppc_sql).fetchone()
 
@@ -684,7 +731,7 @@ class ReportService:
                     AVG_IR_SOILING_RATIO1,
                     TOTAL_IRRADIANCE
                 FROM [WMS]
-                ORDER BY TimeCol DESC
+                ORDER BY TimeCol DESC, MSecCol DESC
             """)
             wms = db.execute(wms_sql).fetchone()
 

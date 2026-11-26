@@ -32,7 +32,7 @@ def get_dashboard_kpis(db: Session = Depends(get_db)):
                 DAILY_OPERATING_TIME,
                 MONTHLY_OPERATING_TIME
             FROM [PPC]
-            ORDER BY TimeCol DESC
+            ORDER BY TimeCol DESC, MSecCol DESC
         """)
         ppc = db.execute(ppc_sql).fetchone()
 
@@ -49,7 +49,7 @@ def get_dashboard_kpis(db: Session = Depends(get_db)):
                 AVG_ALBEDO_UP_IRRADIATION,
                 AVG_GTI_CUMM_IRRADIATION
             FROM [WMS]
-            ORDER BY TimeCol DESC
+            ORDER BY TimeCol DESC, MSecCol DESC
         """)
         wms = db.execute(wms_sql).fetchone()
 
@@ -59,13 +59,13 @@ def get_dashboard_kpis(db: Session = Depends(get_db)):
             SELECT
                 (SELECT TOP 1 INVERTER_TOTAL_ACTIVE_POWER FROM [PPC]
                  WHERE TimeCol <= DATEADD(MINUTE, -15, (SELECT MAX(TimeCol) FROM [PPC]))
-                 ORDER BY TimeCol DESC) AS power_15m_ago,
+                 ORDER BY TimeCol DESC, MSecCol DESC) AS power_15m_ago,
                 (SELECT TOP 1 PLANT_DAILY_PRODUCTION FROM [PPC]
                  WHERE TimeCol <= DATEADD(DAY, -1, (SELECT MAX(TimeCol) FROM [PPC]))
-                 ORDER BY TimeCol DESC) AS daily_prod_yesterday,
+                 ORDER BY TimeCol DESC, MSecCol DESC) AS daily_prod_yesterday,
                 (SELECT TOP 1 PLANT_MONTHLY_PRODUCTION FROM [PPC]
                  WHERE TimeCol <= DATEADD(DAY, -1, (SELECT MAX(TimeCol) FROM [PPC]))
-                 ORDER BY TimeCol DESC) AS monthly_prod_yesterday
+                 ORDER BY TimeCol DESC, MSecCol DESC) AS monthly_prod_yesterday
         """)
         prior = db.execute(prior_sql).fetchone()
 
@@ -392,7 +392,7 @@ def get_inverter_temps(db: Session = Depends(get_db)):
 
         union = " UNION ALL ".join(
             f"SELECT '{t}' AS name, "
-            f"(SELECT TOP 1 CAST([{_TEMP_COL}] AS FLOAT) FROM [{t}] ORDER BY TimeCol DESC) AS temp"
+            f"(SELECT TOP 1 CAST([{_TEMP_COL}] AS FLOAT) FROM [{t}] ORDER BY TimeCol DESC, MSecCol DESC) AS temp"
             for t in tables
         )
         rows = db.execute(text(union)).fetchall()
@@ -489,7 +489,7 @@ def get_irradiance_power(db: Session = Depends(get_db)):
                 SELECT TOP 1 TimeCol, AVG_GHI_IRRADIATION
                 FROM [WMS]
                 WHERE AVG_GHI_IRRADIATION IS NOT NULL
-                ORDER BY TimeCol DESC
+                ORDER BY TimeCol DESC, MSecCol DESC
             """)).fetchone()
             return (r[0], float(r[1])) if r and r[1] is not None else (None, None)
         finally:
@@ -509,7 +509,7 @@ def get_irradiance_power(db: Session = Depends(get_db)):
                 return (None, [])
             col_sql = ", ".join(f"[{c}]" for c in cols)   # names are whitelisted by the LIKE
             row = s.execute(text(
-                f"SELECT TOP 1 TimeCol, {col_sql} FROM [POWER_GRAPH] ORDER BY TimeCol DESC"
+                f"SELECT TOP 1 TimeCol, {col_sql} FROM [POWER_GRAPH] ORDER BY TimeCol DESC, MSecCol DESC"
             )).fetchone()
             if not row:
                 return (None, [])
@@ -571,7 +571,7 @@ def get_dashboard_alarms(
                 UniID,
                 TraID
             FROM [Alarms]
-            ORDER BY TimeCol DESC
+            ORDER BY TimeCol DESC, MSecCol DESC
         """)
         rows = db.execute(sql, {"limit": limit}).fetchall()
 
@@ -605,7 +605,7 @@ def get_equipment_summary(db: Session = Depends(get_db)):
                 INVERTER_TOTAL_ACTIVE_POWER,
                 INVERTER_TOTAL_REACTIVE_POWER
             FROM [PPC]
-            ORDER BY TimeCol DESC
+            ORDER BY TimeCol DESC, MSecCol DESC
         """)
         row = db.execute(sql).fetchone()
         running = int(row[0]) if row and row[0] else 0
